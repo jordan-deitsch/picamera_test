@@ -28,3 +28,6 @@ logs/
 
 # Secrets
 .env
+
+# Trained models (copied to the Pi with scp, not stored in the public repo)
+models/

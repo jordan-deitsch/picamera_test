@@ -21,8 +21,9 @@ Development happens on a Windows PC. Code reaches the Pi through GitHub, and the
 | [`collect_data.py`](collect_data.py) | Pi | Collect labeled training images into `dataset/<label>/` |
 | [`fetch_dataset.py`](fetch_dataset.py) | PC | Copy `dataset/` from the Pi to the PC |
 | [`upload_dataset.py`](upload_dataset.py) | PC | Upload `dataset/` to an Edge Impulse project |
+| [`live_detect.py`](live_detect.py) | Pi | Run the FOMO model on the live camera feed and stream it with overlays to a web page |
 
-Git ignores `captures/` and `dataset/`, so images never go into the repo.
+Git ignores `captures/`, `dataset/`, `models/`, and `.venv/`, so images, model files, and the virtual environment never go into the repo.
 
 ---
 
@@ -35,6 +36,14 @@ Git ignores `captures/` and `dataset/`, so images never go into the repo.
   rpicam-hello --list-cameras
   ```
 - The repo is cloned at `~/picamera_test`. The Pi's SSH key is added to GitHub so it can pull and push.
+- Live detection needs OpenCV, Flask, and PyAudio from apt, and the Edge Impulse Python SDK in a project virtual environment. The virtual environment uses `--system-site-packages`, so it can still see Picamera2, OpenCV, and the system NumPy:
+  ```bash
+  sudo apt install -y python3-opencv python3-flask python3-pyaudio
+  cd ~/picamera_test
+  python3 -m venv --system-site-packages .venv
+  .venv/bin/pip install edge_impulse_linux==1.2.2
+  ```
+  The SDK imports PyAudio even for image models, so it's needed even though this project doesn't use audio. Don't let pip upgrade NumPy inside `.venv`: the apt OpenCV and Picamera2 are built against the system NumPy (1.24).
 
 ### Windows PC
 - Python 3.13 with `requests` (only needed by `upload_dataset.py`):
@@ -180,7 +189,72 @@ The script uses Edge Impulse's **ingestion API**, so Node.js and the Edge Impuls
    - **MobileNetV2 SSD / YOLO-style:** full bounding boxes, but roughly 2–10 frames per second depending on input size.
    - Studio's estimated speed for **Raspberry Pi 4** helps you compare.
 4. **Train**, then check results under **Model testing**.
-5. **Deploy:** choose **Linux (AARCH64)** to get a `.eim` model file for the Pi. Load it in Python with the [`edge_impulse_linux`](https://github.com/edgeimpulse/linux-sdk-python) SDK. The next stage of this project will add the live object-recognition script.
+5. **Deploy:** choose **Linux (AARCH64)** to get a `.eim` model file for the Pi. (The **C++ library** export is for microcontrollers and can't be loaded from Python.) Save it in `models/` on the PC, then copy it to the Pi. See below.
+
+---
+
+## Live detection and streaming
+
+[`live_detect.py`](live_detect.py) runs the Edge Impulse FOMO model on every camera frame and streams the annotated video to a web page. The current model finds the **top** and **bottom** of a pen on a white background. From those two points the script works out the pen's **center** and **orientation**, so a fast FOMO model, which only finds object centers, still gives the full pose.
+
+### 1. Copy the model to the Pi
+
+Model files (`.eim`) are kept out of the public repo, so copy them with `scp`:
+```powershell
+scp "models/<model-name>.eim" pi:picamera_test/models/
+```
+```powershell
+ssh pi "chmod +x ~/picamera_test/models/*.eim"
+```
+The script uses the **newest** `.eim` in `models/` unless you pass `--model`.
+
+### 2. Run it
+
+```powershell
+ssh pi "cd ~/picamera_test && git pull && .venv/bin/python live_detect.py"
+```
+Then open **`http://<pi-ip-address>:8000`** in a browser on the same network. Press Ctrl+C in the terminal to stop. The camera and model are released cleanly.
+
+Options:
+
+| Option | Default | Notes |
+|---|---|---|
+| `--model` | newest `models/*.eim` | Path to a specific model |
+| `--size` | `640x480` | Camera frame size. Keep it the same as the training images |
+| `--min-confidence` | `0.5` | Ignore weaker detections |
+| `--port` | `8000` | Web server port |
+| `--jpeg-quality` | `80` | Stream quality versus bandwidth |
+| `--print` | – | Also print detections to the console |
+
+### What the overlay shows
+
+| Element | Meaning |
+|---|---|
+| Green dot | `pen_top`: the strongest detection, with its frame coordinates and confidence |
+| Orange dot | `pen_bottom`: the same, for the bottom |
+| Small hollow dots | Weaker extra detections. FOMO can mark several neighboring cells for one object |
+| Cyan line | Bottom → top: the pen's orientation |
+| Magenta crosshair | The pen's center (midpoint of top and bottom) |
+| Gray square | The center square of the frame that the model actually sees. Objects outside it aren't detected |
+| Top-left | Stream FPS and model inference time |
+| Bottom-left | Orientation angle and length in pixels, or which point is missing |
+
+**Angle convention:** the direction from bottom to top, in degrees, counter-clockwise from pointing right, with "up" on screen positive. **90°** = top pointing straight up, **0°** = right, **180°** = left, **−90°** = down. All coordinates are frame pixels with the origin at the top-left (y increases downward).
+
+### Web endpoints
+
+| URL | Returns |
+|---|---|
+| `/` | Viewer page: live stream plus live coordinates, angle, and FPS |
+| `/stream` | MJPEG video with overlays |
+| `/snapshot.jpg` | One annotated frame |
+| `/api/detections` | Latest result as JSON (`top`, `bottom`, `pose`, `fps`, `inference_ms`, `all_points`). Intended for robot control later |
+
+### Performance and framing notes
+- On the Pi 4 the 96x96 FOMO model takes about **5 ms per frame**. The stream runs at the camera's **30 FPS**, leaving most of the processor free for robot control.
+- The model uses the **fit-shortest** resize mode: each frame is center-cropped to a square (480x480 from 640x480) and scaled to 96x96. The script maps the detections back to full-frame pixels.
+- The script forces a **full-field-of-view sensor mode** (2304x1296). On the Camera Module 3, the faster 1536x864 mode is a center crop, which would zoom in compared to the training images.
+- The web page has no login. Use it only on your home network; for remote access, use a VPN such as Tailscale instead of opening a port on your router.
 
 ---
 
