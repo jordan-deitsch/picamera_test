@@ -208,12 +208,56 @@ ssh pi "chmod +x ~/picamera_test/models/*.eim"
 ```
 The script uses the **newest** `.eim` in `models/` unless you pass `--model`.
 
-### 2. Run it
+### 2. Start it
 
+**From the PC (recommended):** always use **`-t`**. It gives the Pi a terminal, so Ctrl+C reaches the script:
 ```powershell
-ssh pi "cd ~/picamera_test && git pull && .venv/bin/python live_detect.py"
+ssh -t pi "cd ~/picamera_test && .venv/bin/python live_detect.py"
 ```
-Then open **`http://<pi-ip-address>:8000`** in a browser on the same network. Press Ctrl+C in the terminal to stop. The camera and model are released cleanly.
+To update the code on the Pi first:
+```powershell
+ssh -t pi "cd ~/picamera_test && git pull && .venv/bin/python live_detect.py"
+```
+**Directly on the Pi** (local terminal, or after `ssh pi`):
+```bash
+cd ~/picamera_test
+.venv/bin/python live_detect.py
+```
+**In the background**, so it keeps running after you close the terminal. Output goes to `/tmp/live_detect.log`:
+```powershell
+ssh pi "cd ~/picamera_test && nohup .venv/bin/python live_detect.py > /tmp/live_detect.log 2>&1 &"
+```
+
+Then open **`http://<pi-ip-address>:8000`** in a browser on the same network.
+
+### 3. Stop it
+
+The script stops cleanly on either Ctrl+C or `kill`: it stops the camera, shuts down the model, and exits.
+
+**Started in the foreground:** press **Ctrl+C** in that terminal.
+
+> **Without `-t`, Ctrl+C only closes your SSH connection.** The script can keep running on the Pi and keep holding the camera. The next run then fails with a "camera busy" error. Use the command below to stop it.
+
+**Started in the background, or left running:** from any PC terminal:
+```powershell
+ssh pi "pkill -f '[.]venv/bin/python live_detect'"
+```
+Or directly on the Pi:
+```bash
+pkill -f '[.]venv/bin/python live_detect'
+```
+The brackets in `[.]venv` stop `pkill` from matching, and killing, the shell command that runs it. Without them, `pkill -f live_detect.py` over SSH ends your own SSH session.
+
+**Check whether it's running:**
+```powershell
+ssh pi "pgrep -af '[.]venv/bin/python live_detect' || echo 'not running'"
+```
+**View the log of a background run:**
+```powershell
+ssh pi "tail -n 30 /tmp/live_detect.log"
+```
+
+If it ignores a normal stop (it shouldn't), force it with `pkill -9 -f '[.]venv/bin/python live_detect'`. The camera is freed when the process exits.
 
 Options:
 
@@ -265,7 +309,7 @@ Options:
 | `Permission denied (publickey)` from `ssh pi` | Check that `~/.ssh/id_ed25519_pi.pub` is in `~/.ssh/authorized_keys` on the Pi and that the `pi` entry in `~/.ssh/config` is correct |
 | `ssh: connect to host ... timed out` | The Pi is off, or its IP address changed. Find it on the router (or check the ARP table with `arp -a`) and update `HostName` |
 | `Permission denied (publickey)` on `git pull` on the Pi | The Pi's `~/.ssh/id_ed25519.pub` must be added to GitHub. Test with `ssh -T git@github.com` on the Pi |
-| Camera errors such as `Device or resource busy` | Another program is using the camera. Stop it (`pkill -f rpicam`, or another Python script) and try again |
+| Camera errors such as `Device or resource busy` | Another program is using the camera, often a `live_detect.py` left running after Ctrl+C without `ssh -t`. Stop it with `ssh pi "pkill -f '[.]venv/bin/python live_detect'"` (or `pkill -f '[r]picam'` for camera apps), then try again |
 | `No interactive input (use 'ssh -t' or --count)` | Run interactive collection with `ssh -t`, or use burst mode |
 | `Set the EI_API_KEY environment variable...` | Set `$env:EI_API_KEY` in the same terminal before running `upload_dataset.py` |
 | Upload returns `HTTP 401/403` | The API key is wrong or belongs to a different project |
