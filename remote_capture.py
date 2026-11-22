@@ -14,7 +14,6 @@ Usage:
 """
 
 import argparse
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -24,7 +23,9 @@ DEFAULT_LOCAL_DIR = PROJECT_DIR / "captures"
 DEFAULT_HOST = "pi"
 DEFAULT_REMOTE_PROJECT = "~/picamera_test"
 
-# Never prompt for a password; fail fast if key auth isn't working.
+# Options added to every ssh/scp call:
+#   BatchMode=yes     never prompt for a password; fail fast if key login is broken
+#   ConnectTimeout=10 don't hang for minutes if the Pi is off or its IP changed
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
 
 
@@ -47,7 +48,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_remote(host: str, command: str) -> str:
-    """Run a shell command on the Pi, stream its output, and return stdout."""
+    """Run a shell command on the Pi via ssh, print its output, and return stdout.
+
+    Exits with an error message if the remote command fails.
+    """
     result = subprocess.run(
         ["ssh", *SSH_OPTS, host, command],
         capture_output=True,
@@ -56,6 +60,7 @@ def run_remote(host: str, command: str) -> str:
     if result.stdout:
         print(result.stdout, end="")
     if result.returncode != 0:
+        # stderr is only shown on failure; on success it is mostly libcamera log noise.
         print(result.stderr, end="", file=sys.stderr)
         raise SystemExit(f"Remote command failed (exit {result.returncode}): {command}")
     return result.stdout
@@ -63,17 +68,19 @@ def run_remote(host: str, command: str) -> str:
 
 def main() -> int:
     args = parse_args()
-    # The remote project path may start with "~", which the remote shell must expand,
-    # so it is passed unquoted; it comes from this script's own arguments, not from the Pi.
+    # Passed unquoted so the Pi's shell expands "~". The value comes from this
+    # script's own arguments, not from the Pi.
     remote_dir = args.remote_project
 
     if args.pull:
         print(f"[1/3] git pull on {args.host}")
+        # --ff-only: refuse to create merge commits on the Pi; fail instead.
         run_remote(args.host, f"cd {remote_dir} && git pull --ff-only")
 
     print(f"[2/3] Capturing still on {args.host}")
     output = run_remote(args.host, f"cd {remote_dir} && python3 capture_still.py")
 
+    # capture_still.py prints "SAVED: <absolute path>" as its result.
     saved_lines = [line for line in output.splitlines() if line.startswith("SAVED: ")]
     if not saved_lines:
         raise SystemExit("Could not find 'SAVED: <path>' in the capture script output.")
@@ -84,8 +91,10 @@ def main() -> int:
     local_path = local_dir / Path(remote_path).name
 
     print(f"[3/3] Copying {remote_path} -> {local_path}")
-    # scp's remote side goes through a shell, so quote the path for it.
-    result = subprocess.run(["scp", *SSH_OPTS, f"{args.host}:{shlex.quote(remote_path)}", str(local_path)])
+    # The path is passed as-is (no shell quoting): OpenSSH 9+ scp transfers over
+    # SFTP, which doesn't run a remote shell, so quote characters would become part
+    # of the file name. capture_still.py's file names never contain spaces.
+    result = subprocess.run(["scp", *SSH_OPTS, f"{args.host}:{remote_path}", str(local_path)])
     if result.returncode != 0:
         raise SystemExit(f"scp failed (exit {result.returncode})")
 

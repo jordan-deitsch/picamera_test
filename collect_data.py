@@ -28,6 +28,7 @@ from pathlib import Path
 
 from picamera2 import Picamera2
 
+# libcamera control enums (autofocus modes); ship with Picamera2 on Pi OS.
 try:
     from libcamera import controls
 except ImportError:
@@ -37,6 +38,7 @@ DEFAULT_DATASET_DIR = Path(__file__).resolve().parent / "dataset"
 
 
 def parse_size(text: str) -> tuple[int, int]:
+    """argparse type for "WIDTHxHEIGHT" strings, e.g. "640x480" -> (640, 480)."""
     try:
         width, height = (int(v) for v in text.lower().split("x"))
     except ValueError:
@@ -64,22 +66,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quality", type=int, default=95, help="JPEG quality 1-100 (default: 95)")
     args = parser.parse_args()
 
-    # The label becomes part of folder and file names; keep it simple and safe.
+    # The label becomes part of folder and file names, so allow only safe
+    # characters (this also blocks things like "../" path tricks).
     if not args.label.replace("_", "").replace("-", "").isalnum():
         parser.error("label may only contain letters, numbers, '-' and '_'")
     if args.count is not None and args.count < 1:
         parser.error("--count must be at least 1")
+    if not 1 <= args.quality <= 100:
+        parser.error("--quality must be between 1 and 100")
     return args
 
 
 def start_camera(size: tuple[int, int], quality: int) -> Picamera2:
-    picam2 = Picamera2()
+    """Open, configure, and start the camera. Caller must stop()/close() it."""
+    try:
+        picam2 = Picamera2()
+    except (RuntimeError, IndexError) as exc:
+        raise SystemExit(f"Could not open the camera ({exc}). Is another camera script still running?")
+
+    # A still configuration at the requested size. buffer_count=2 keeps memory
+    # use low; we only ever need the latest frame.
     config = picam2.create_still_configuration(main={"size": size}, buffer_count=2)
     picam2.configure(config)
-    picam2.options["quality"] = quality
+    picam2.options["quality"] = quality  # JPEG quality used by capture_file()
     picam2.start()
 
-    # Camera Module 3: continuous autofocus keeps up as objects move between shots.
+    # Camera Module 3: continuous autofocus keeps refocusing in the background
+    # as you move the object between shots (no blocking focus cycle needed).
     if controls is not None and "AfMode" in picam2.camera_controls:
         picam2.set_controls({"AfMode": controls.AfModeEnum.Continuous})
 
@@ -92,15 +105,22 @@ def main() -> int:
     label_dir: Path = (args.dataset_dir.expanduser() / args.label).resolve()
     label_dir.mkdir(parents=True, exist_ok=True)
 
+    # One timestamp per run ("session"), plus a running number per image.
     session = datetime.now().strftime("%Y%m%d_%H%M%S")
-    saved = 0
+    saved = 0       # images saved in this run
+    next_index = 1  # number used in the next file name
 
     def capture(picam2: Picamera2) -> None:
-        nonlocal saved
-        path = label_dir / f"{args.label}.{session}_{saved + 1:04d}.jpg"
+        """Save one image with a file name that is never reused."""
+        nonlocal saved, next_index
+        # Skip names that already exist, e.g. from another run started in the
+        # same second, so earlier images are never overwritten.
+        while (path := label_dir / f"{args.label}.{session}_{next_index:04d}.jpg").exists():
+            next_index += 1
         picam2.capture_file(str(path))
         saved += 1
-        print(f"[{saved}] {path.name}", flush=True)
+        next_index += 1
+        print(f"[{saved}] {path.name}", flush=True)  # flush: show progress immediately over SSH
 
     picam2 = start_camera(args.size, args.quality)
     width, height = picam2.camera_configuration()["main"]["size"]
@@ -108,17 +128,20 @@ def main() -> int:
 
     try:
         if args.count:
+            # Burst mode: fixed number of images at a fixed interval.
             print(f"Burst mode: {args.count} images, {args.interval}s apart. Ctrl+C to stop early.", flush=True)
             for i in range(args.count):
                 capture(picam2)
                 if i < args.count - 1:
                     time.sleep(args.interval)
         else:
+            # Interactive mode: each Enter press takes one image.
             print("Interactive mode: press Enter to capture, 'q' + Enter to quit.", flush=True)
             while True:
                 try:
                     command = input()
                 except EOFError:
+                    # stdin closed, e.g. ssh without -t: nothing can be typed.
                     print("No interactive input (use 'ssh -t' or --count). Stopping.", file=sys.stderr)
                     break
                 if command.strip().lower() == "q":
@@ -127,6 +150,7 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nStopped.", flush=True)
     finally:
+        # Always release the camera so other scripts can use it.
         picam2.stop()
         picam2.close()
 

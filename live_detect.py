@@ -6,32 +6,41 @@ Runs ON THE RASPBERRY PI, inside the project virtual environment:
     .venv/bin/python live_detect.py
 Then open http://<pi-ip-address>:8000 in a browser on the same network.
 
-Pipeline (one background thread):
-    Picamera2 frame (640x480) -> center square crop -> 96x96 -> FOMO model
-      -> "pen_top" / "pen_bottom" cell centroids, mapped back to frame pixels
-      -> jitter reduction:
-           1. spatial: confidence-weighted average of the strongest cell and its
-              neighbouring cells of the same label (sub-cell precision instead of
-              snapping to FOMO's coarse grid)
-           2. temporal: One Euro filter per point (smooth when still, responsive
-              when moving), plus a short hold so a point that drops out for a
-              frame or two doesn't flicker
-      -> overlay: both points, a line between them, the pen's center point,
-         and its orientation angle
-      -> JPEG -> web page (MJPEG stream) + JSON API
+ARCHITECTURE
+------------
+Two threads share one "latest result" (protected by a threading.Condition):
+
+  Detector thread (class Detector)              Main thread (Flask web server)
+  --------------------------------              ------------------------------
+  loop:                                         /                -> viewer page (PAGE)
+    capture frame (Picamera2, 640x480 BGR)      /stream          -> MJPEG: sends each new JPEG
+    run FOMO model (.eim) on the frame          /snapshot.jpg    -> latest JPEG
+    -> raw cells per label                      /api/detections  -> latest result as JSON
+    -> jitter reduction (refined_point +
+       PointTracker)
+    -> pen pose (center, angle, length)
+    -> draw overlay, encode JPEG
+    -> publish JPEG + JSON  ------------------>  (read by the web handlers)
+
+Processing steps per frame:
+  1. Model input: the model's resize mode decides which part of the frame it
+     sees. Ours is "fit-shortest": center square crop (480x480) -> 96x96.
+  2. FOMO output: small boxes (one per grid cell, 8x8 model px) with a label and
+     a confidence. We use each box's center and map it back to frame pixels.
+  3. Jitter reduction, per label ("pen_top", "pen_bottom"):
+       a. spatial  - confidence-weighted average of the strongest cell and its
+                     neighbouring cells (sub-cell precision, no grid snapping)
+       b. temporal - One Euro filter (smooth when still, responsive when moving)
+       c. hold     - keep the last position for a few frames if a point drops out
+  4. Pose: center = midpoint of top and bottom; angle and length of bottom->top.
 
 Orientation convention: angle of the vector from pen_bottom to pen_top,
 in degrees, measured counter-clockwise from the +x axis (to the right) with
 y pointing up on screen. 90 = top pointing straight up, 0 = pointing right,
 180/-180 = pointing left, -90 = pointing down.
-
-Web endpoints:
-    /                 viewer page (stream + live numbers)
-    /stream           MJPEG video with overlays
-    /snapshot.jpg     single annotated frame
-    /api/detections   latest detection result as JSON (for robot control later)
 """
 
+import _thread
 import argparse
 import logging
 import math
@@ -46,49 +55,76 @@ from edge_impulse_linux.image import ImageImpulseRunner
 from flask import Flask, Response, jsonify
 from picamera2 import Picamera2
 
+# libcamera control enums (autofocus modes); ship with Picamera2 on Pi OS.
 try:
     from libcamera import controls
 except ImportError:
     controls = None
 
 PROJECT_DIR = Path(__file__).resolve().parent
+
+# Model labels this script tracks (must match the labels trained in Edge Impulse).
 TOP_LABEL = "pen_top"
 BOTTOM_LABEL = "pen_bottom"
 
-# Overlay colors (OpenCV uses BGR order).
+# Overlay colors. OpenCV uses BGR order, not RGB.
 COLOR_TOP = (60, 220, 60)        # green
 COLOR_BOTTOM = (0, 140, 255)     # orange
 COLOR_LINE = (255, 220, 0)       # cyan
 COLOR_CENTER = (255, 0, 255)     # magenta
-COLOR_CROP = (160, 160, 160)     # gray: the square region the model sees
+COLOR_CROP = (160, 160, 160)     # gray: the region the model sees
 COLOR_TEXT = (255, 255, 255)
 
 
-# --------------------------------------------------------------------------- data
+# =========================================================================== data
 
 
 @dataclass
 class Point:
+    """One detected point (a FOMO cell, or a refined/smoothed position)."""
+
     label: str
-    x: float          # frame pixel coordinates (origin top-left)
+    x: float           # frame pixel coordinates (origin top-left, y grows downward)
     y: float
-    confidence: float
-    size: float = 0.0  # FOMO cell size in frame pixels
+    confidence: float  # model score 0..1
+    size: float = 0.0  # FOMO cell size in frame pixels (used as the neighbour radius unit)
     held: bool = False  # True if not detected this frame and showing the last position
 
 
 @dataclass
 class PenPose:
+    """Pen position and orientation derived from the top and bottom points."""
+
     center_x: float
     center_y: float
     angle_deg: float  # see module docstring for the convention
     length_px: float
 
 
-# --------------------------------------------------------------------------- args
+@dataclass
+class ModelRegion:
+    """Part of the camera frame that the model actually sees, in frame pixels.
+
+    Model coordinates (0..model_w, 0..model_h) map linearly onto this rectangle.
+    With "fit-longest" the region is larger than the frame (it includes padding),
+    so x0/y0 can be negative.
+    """
+
+    x0: float
+    y0: float
+    width: float
+    height: float
+
+    def is_crop(self, frame_w: int, frame_h: int) -> bool:
+        """True if the region is a crop *inside* the frame (worth outlining)."""
+        return self.x0 > 0 or self.y0 > 0 or self.width < frame_w or self.height < frame_h
+
+
+# =========================================================================== command line
 
 
 def parse_size(text: str) -> tuple[int, int]:
+    """argparse type for "WIDTHxHEIGHT" strings, e.g. "640x480" -> (640, 480)."""
     try:
         width, height = (int(v) for v in text.lower().split("x"))
     except ValueError:
@@ -97,6 +133,7 @@ def parse_size(text: str) -> tuple[int, int]:
 
 
 def newest_model() -> Path | None:
+    """Most recently modified .eim file in ./models, or None."""
     models = sorted((PROJECT_DIR / "models").glob("*.eim"), key=lambda p: p.stat().st_mtime)
     return models[-1] if models else None
 
@@ -110,10 +147,15 @@ def parse_args() -> argparse.Namespace:
         default=(640, 480),
         help="Camera frame size (default: 640x480, same as the training images)",
     )
-    parser.add_argument("--min-confidence", type=float, default=0.5, help="Ignore detections below this (default: 0.5)")
+    parser.add_argument(
+        "--min-confidence",
+        type=float,
+        default=0.5,
+        help="Detection threshold 0-1, applied inside the model (default: 0.5)",
+    )
     parser.add_argument("--host", default="0.0.0.0", help="Web server address (default: all interfaces)")
     parser.add_argument("--port", type=int, default=8000, help="Web server port (default: 8000)")
-    parser.add_argument("--jpeg-quality", type=int, default=80, help="Stream JPEG quality (default: 80)")
+    parser.add_argument("--jpeg-quality", type=int, default=80, help="Stream JPEG quality 1-100 (default: 80)")
     parser.add_argument("--print", dest="print_results", action="store_true", help="Also print detections to the console")
 
     smooth = parser.add_argument_group("jitter reduction")
@@ -142,64 +184,90 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
 
+    # Validate ranges up front so mistakes fail with a clear message.
+    if not 0.0 < args.min_confidence <= 1.0:
+        parser.error("--min-confidence must be between 0 and 1")
+    if not 1 <= args.jpeg_quality <= 100:
+        parser.error("--jpeg-quality must be between 1 and 100")
+    if args.min_cutoff <= 0 or args.beta < 0 or args.hold_frames < 0:
+        parser.error("--min-cutoff must be > 0, --beta and --hold-frames must be >= 0")
+
     args.model = args.model or newest_model()
     if args.model is None or not args.model.is_file():
         parser.error("no .eim model found; put one in ./models or pass --model")
     return args
 
 
-# --------------------------------------------------------------------------- camera
+# =========================================================================== camera
 
 
 def start_camera(size: tuple[int, int]) -> Picamera2:
-    picam2 = Picamera2()
+    """Open, configure, and start the camera for continuous video frames."""
+    try:
+        picam2 = Picamera2()
+    except (RuntimeError, IndexError) as exc:
+        raise RuntimeError(f"Could not open the camera ({exc}). Is another camera script still running?") from exc
 
-    # Use the smallest sensor mode that still covers the FULL sensor area, so the
-    # field of view matches the full-FOV training images. (On the Camera Module 3
-    # the fastest 1536x864 mode is a center crop, which would zoom in.)
+    # Pick the smallest sensor mode that still covers the FULL sensor area, so
+    # the field of view matches the full-FOV training images. (On the Camera
+    # Module 3 the fastest 1536x864 mode is a center crop, which would zoom in.)
+    # crop_limits = (x, y, width, height) of the sensor area a mode reads.
     modes = picam2.sensor_modes
     full_area = max(m["crop_limits"][2] * m["crop_limits"][3] for m in modes)
     full_fov = [m for m in modes if m["crop_limits"][2] * m["crop_limits"][3] == full_area]
     sensor_mode = min(full_fov, key=lambda m: m["size"][0] * m["size"][1])
 
     config = picam2.create_video_configuration(
-        # "RGB888" in libcamera means BGR byte order in the numpy array, which is what OpenCV uses.
+        # "RGB888" in libcamera means BGR byte order in the numpy array,
+        # which is exactly what OpenCV expects.
         main={"size": size, "format": "RGB888"},
+        # Forcing the raw stream size selects the sensor mode chosen above.
         raw={"size": sensor_mode["size"], "format": sensor_mode["unpacked"]},
-        buffer_count=4,
+        buffer_count=4,  # a few buffers so capture never waits on processing
     )
     picam2.configure(config)
     picam2.start()
+    # Continuous autofocus: refocuses automatically as the scene changes.
     if controls is not None and "AfMode" in picam2.camera_controls:
         picam2.set_controls({"AfMode": controls.AfModeEnum.Continuous})
     time.sleep(1.0)  # let exposure / white balance / focus settle
     return picam2
 
 
-# --------------------------------------------------------------------------- detection
+# =========================================================================== model output -> points
 
 
-def model_crop(frame_w: int, frame_h: int) -> tuple[int, int, int]:
-    """The 'fit-shortest' resize mode center-crops a square. Return (x0, y0, side)."""
-    side = min(frame_w, frame_h)
-    return (frame_w - side) // 2, (frame_h - side) // 2, side
+def model_region(frame_w: int, frame_h: int, resize_mode: str) -> ModelRegion:
+    """Which part of the frame the model sees, for Edge Impulse's resize modes.
+
+    fit-shortest: center square crop (side = shorter frame edge), then scale.
+    fit-longest:  pad the shorter edge to make a square (side = longer edge), then scale.
+    squash:       the whole frame, stretched to the model's aspect ratio.
+    """
+    if resize_mode == "squash":
+        return ModelRegion(0, 0, frame_w, frame_h)
+    if resize_mode in ("fit-shortest", "fit-longest"):
+        side = min(frame_w, frame_h) if resize_mode == "fit-shortest" else max(frame_w, frame_h)
+        return ModelRegion((frame_w - side) / 2, (frame_h - side) / 2, side, side)
+    raise ValueError(f"Unsupported model resize mode: {resize_mode!r}")
 
 
-def extract_points(result: dict, frame_w: int, frame_h: int, model_w: int, model_h: int, min_conf: float) -> list[Point]:
-    """Convert FOMO boxes (in model-input pixels) to centroids in frame pixels."""
-    x0, y0, side = model_crop(frame_w, frame_h)
-    sx, sy = side / model_w, side / model_h
+def extract_points(result: dict, region: ModelRegion, model_w: int, model_h: int) -> list[Point]:
+    """Convert FOMO boxes (model-input pixels) to cell-center Points in frame pixels.
+
+    The model has already dropped boxes below the threshold (see set_model_threshold).
+    """
+    sx, sy = region.width / model_w, region.height / model_h  # frame px per model px
     points = []
     for box in result.get("result", {}).get("bounding_boxes", []):
-        if box["value"] < min_conf:
-            continue
-        cx = (box["x"] + box["width"] / 2) * sx + x0
-        cy = (box["y"] + box["height"] / 2) * sy + y0
+        cx = (box["x"] + box["width"] / 2) * sx + region.x0
+        cy = (box["y"] + box["height"] / 2) * sy + region.y0
         points.append(Point(box["label"], cx, cy, box["value"], size=box["width"] * sx))
     return points
 
 
 def strongest(points: list[Point], label: str) -> Point | None:
+    """Highest-confidence point with the given label (raw FOMO output, no smoothing)."""
     candidates = [p for p in points if p.label == label]
     return max(candidates, key=lambda p: p.confidence) if candidates else None
 
@@ -218,6 +286,8 @@ def refined_point(points: list[Point], label: str, radius_cells: float = 1.5) ->
     radius = radius_cells * best.size
     near = [p for p in points if p.label == label and math.hypot(p.x - best.x, p.y - best.y) <= radius]
     weight = sum(p.confidence for p in near)
+    if weight <= 0:  # only possible with zero-confidence cells; avoid dividing by zero
+        return best
     return Point(
         label,
         sum(p.x * p.confidence for p in near) / weight,
@@ -227,19 +297,27 @@ def refined_point(points: list[Point], label: str, radius_cells: float = 1.5) ->
     )
 
 
+# =========================================================================== temporal smoothing
+
+
 class OneEuroFilter:
-    """One Euro filter (Casiez et al., 2012): a low-pass filter whose cutoff rises
-    with speed. Still objects get heavy smoothing (no jitter); moving objects get
-    light smoothing (little lag)."""
+    """One Euro filter (Casiez et al., 2012) for one coordinate.
+
+    An exponential low-pass filter whose cutoff frequency rises with speed:
+      cutoff = min_cutoff + beta * |smoothed speed|
+    Still objects -> low cutoff -> heavy smoothing (no jitter).
+    Moving objects -> higher cutoff -> light smoothing (little lag).
+    """
 
     def __init__(self, min_cutoff: float, beta: float, d_cutoff: float = 1.0):
         self.min_cutoff, self.beta, self.d_cutoff = min_cutoff, beta, d_cutoff
-        self.x_prev: float | None = None
-        self.dx_prev = 0.0
-        self.t_prev = 0.0
+        self.x_prev: float | None = None  # last filtered value (None = no history)
+        self.dx_prev = 0.0                # last filtered speed
+        self.t_prev = 0.0                 # time of the last sample (seconds)
 
     @staticmethod
     def _alpha(dt: float, cutoff: float) -> float:
+        """Smoothing factor of a first-order low-pass filter for this time step."""
         tau = 1.0 / (2 * math.pi * cutoff)
         return 1.0 / (1.0 + tau / dt)
 
@@ -247,15 +325,18 @@ class OneEuroFilter:
         self.x_prev = None
 
     def __call__(self, x: float, t: float) -> float:
-        if self.x_prev is None:
+        """Filter a new sample x taken at time t (seconds); returns the smoothed value."""
+        if self.x_prev is None:  # first sample: nothing to smooth against yet
             self.x_prev, self.dx_prev, self.t_prev = x, 0.0, t
             return x
         dt = t - self.t_prev
         if dt <= 0:
             return self.x_prev
+        # 1. Estimate speed, smoothed with a fixed cutoff (d_cutoff).
         dx = (x - self.x_prev) / dt
         a_d = self._alpha(dt, self.d_cutoff)
         dx_hat = a_d * dx + (1 - a_d) * self.dx_prev
+        # 2. Smooth the value with a cutoff that grows with that speed.
         a = self._alpha(dt, self.min_cutoff + self.beta * abs(dx_hat))
         x_hat = a * x + (1 - a) * self.x_prev
         self.x_prev, self.dx_prev, self.t_prev = x_hat, dx_hat, t
@@ -264,17 +345,21 @@ class OneEuroFilter:
 
 class PointTracker:
     """Temporal jitter reduction for one label: One Euro filter on x and y, and a
-    short hold so brief detection dropouts don't make the point flicker."""
+    short hold so brief detection dropouts don't make the point flicker.
+
+    With enabled=False it passes points straight through (no filter, no hold).
+    """
 
     def __init__(self, min_cutoff: float, beta: float, hold_frames: int, enabled: bool = True):
         self.enabled = enabled
         self.hold_frames = hold_frames if enabled else 0
         self.fx = OneEuroFilter(min_cutoff, beta)
         self.fy = OneEuroFilter(min_cutoff, beta)
-        self.last: Point | None = None
-        self.missed = 0
+        self.last: Point | None = None  # last output, re-shown while "held"
+        self.missed = 0                 # consecutive frames without a detection
 
     def update(self, p: Point | None, t: float) -> Point | None:
+        """Feed this frame's measurement (None if not detected); returns the point to use."""
         if p is not None:
             self.missed = 0
             if self.enabled:
@@ -282,10 +367,10 @@ class PointTracker:
             self.last = p
             return p
 
+        # Not detected this frame: show the last position for up to hold_frames frames.
         self.missed += 1
         if self.last is not None and self.missed <= self.hold_frames:
-            held = Point(**{**asdict(self.last), "held": True})
-            return held
+            return Point(**{**asdict(self.last), "held": True})
         # Lost for too long: forget it so the next detection starts fresh
         # instead of sliding in from the old position.
         self.last = None
@@ -295,8 +380,9 @@ class PointTracker:
 
 
 def pen_pose(top: Point, bottom: Point) -> PenPose:
+    """Center, orientation angle, and length of the pen from its two end points."""
     dx = top.x - bottom.x
-    dy = bottom.y - top.y  # flip so that "up" on screen is positive
+    dy = bottom.y - top.y  # flip sign: image y grows downward, but we want "up" positive
     return PenPose(
         center_x=(top.x + bottom.x) / 2,
         center_y=(top.y + bottom.y) / 2,
@@ -305,11 +391,11 @@ def pen_pose(top: Point, bottom: Point) -> PenPose:
     )
 
 
-# --------------------------------------------------------------------------- overlay
+# =========================================================================== overlay drawing
 
 
 def put_text(img, text: str, org: tuple[int, int], color=COLOR_TEXT, scale: float = 0.5) -> None:
-    """Text with a dark background box for readability on a white background."""
+    """Text at a fixed position (org = baseline start), on a dark background box."""
     font = cv2.FONT_HERSHEY_SIMPLEX
     (w, h), baseline = cv2.getTextSize(text, font, scale, 1)
     x, y = org
@@ -351,6 +437,7 @@ def put_label(img, text: str, anchor: tuple[int, int], color, below: bool = Fals
 
 def draw_overlay(
     frame,
+    region: ModelRegion,
     raw_points: list[Point],
     top: Point | None,
     bottom: Point | None,
@@ -358,15 +445,20 @@ def draw_overlay(
     fps: float,
     infer_ms: float,
 ) -> None:
+    """Draw all detection graphics onto the frame (in place)."""
     h, w = frame.shape[:2]
-    x0, y0, side = model_crop(w, h)
-    cv2.rectangle(frame, (x0, y0), (x0 + side - 1, y0 + side - 1), COLOR_CROP, 1)
+
+    # Outline the area the model sees, if it's a crop of the frame.
+    if region.is_crop(w, h):
+        x0, y0 = round(region.x0), round(region.y0)
+        cv2.rectangle(frame, (x0, y0), (x0 + round(region.width) - 1, y0 + round(region.height) - 1), COLOR_CROP, 1)
 
     # Raw FOMO cells for this frame as small hollow dots (shows what was smoothed).
     for p in raw_points:
         color = COLOR_TOP if p.label == TOP_LABEL else COLOR_BOTTOM
         cv2.circle(frame, (round(p.x), round(p.y)), 4, color, 1, cv2.LINE_AA)
 
+    # Pen line (bottom -> top) and center marker, when both ends are known.
     if pose is not None:
         cv2.line(frame, (round(bottom.x), round(bottom.y)), (round(top.x), round(top.y)), COLOR_LINE, 2, cv2.LINE_AA)
         c = (round(pose.center_x), round(pose.center_y))
@@ -374,11 +466,12 @@ def draw_overlay(
         cv2.circle(frame, c, 5, COLOR_CENTER, 1, cv2.LINE_AA)
         put_label(frame, "center", c, COLOR_CENTER, below=True)
 
+    # End points: filled dot if detected this frame, hollow ring if "held".
     for p, color, name in ((top, COLOR_TOP, "top"), (bottom, COLOR_BOTTOM, "bottom")):
         if p is None:
             continue
         pt = (round(p.x), round(p.y))
-        if p.held:  # not detected this frame: hollow marker
+        if p.held:
             cv2.circle(frame, pt, 7, color, 2, cv2.LINE_AA)
             text = f"{name} held"
         else:
@@ -387,6 +480,7 @@ def draw_overlay(
             text = f"{name} {p.confidence:.2f}"
         put_label(frame, text, pt, color)
 
+    # Status lines: performance (top-left) and pose summary (bottom-left).
     put_text(frame, f"{fps:4.1f} FPS | inference {infer_ms:4.1f} ms", (8, 20))
     if pose is not None:
         status = f"angle {pose.angle_deg:6.1f} deg | length {pose.length_px:5.0f} px"
@@ -397,92 +491,139 @@ def draw_overlay(
     put_text(frame, status, (8, h - 10))
 
 
-# --------------------------------------------------------------------------- detector thread
+# =========================================================================== detector thread
+
+
+def point_json(p: Point | None) -> dict | None:
+    """Point -> JSON-friendly dict with rounded numbers (None stays None)."""
+    if p is None:
+        return None
+    d = asdict(p)
+    d.update(x=round(p.x, 1), y=round(p.y, 1), confidence=round(p.confidence, 3), size=round(p.size, 1))
+    return d
+
+
+def set_model_threshold(runner: ImageImpulseRunner, params: dict, min_score: float) -> None:
+    """Apply --min-confidence inside the model.
+
+    The .eim model drops detections below its built-in threshold (0.5 by default)
+    before Python sees them, so filtering in Python alone could only *raise* the
+    threshold. Setting it in the model works in both directions.
+    """
+    for threshold in params.get("thresholds", []):
+        if threshold.get("type") == "object_detection":
+            if threshold.get("min_score") != min_score:
+                runner.set_threshold({"id": threshold["id"], "min_score": min_score})
+                logging.info("Detection threshold: %.2f (model default %.2f)", min_score, threshold.get("min_score"))
+            return
+    logging.warning("Model reports no object-detection threshold; using its built-in default")
 
 
 class Detector(threading.Thread):
+    """Background thread: camera -> model -> smoothing -> overlay -> latest result.
+
+    Shared with the web handlers (always accessed while holding self.cond):
+      self.jpeg      latest annotated frame as JPEG bytes
+      self.latest    latest result dict (served as JSON)
+      self.frame_id  increments on every new frame, so waiters can tell "new" from "old"
+    """
+
     def __init__(self, args: argparse.Namespace):
         super().__init__(daemon=True, name="detector")
         self.args = args
-        self.stop_event = threading.Event()
-        self.ready = threading.Event()
+        self.stop_event = threading.Event()  # set by main() to ask the loop to exit
+        self.ready = threading.Event()       # set once streaming starts (or startup failed)
         self.error: BaseException | None = None
-        self.cond = threading.Condition()
+        self.cond = threading.Condition()    # lock + "new frame" notifications
         self.jpeg: bytes | None = None
         self.frame_id = 0
         self.latest: dict = {"status": "starting"}
 
     def run(self) -> None:
+        """Thread entry point: run the loop and report any crash to the main thread."""
         try:
             self._loop()
-        except BaseException as exc:  # surface errors to the main thread
+        except BaseException as exc:
             self.error = exc
             logging.exception("Detector thread failed")
+            if self.ready.is_set():
+                # Failed while streaming: stop the whole program instead of
+                # serving a frozen image (raises KeyboardInterrupt in main()).
+                _thread.interrupt_main()
         finally:
             self.ready.set()
             with self.cond:
-                self.cond.notify_all()
+                self.cond.notify_all()  # wake any web handlers waiting for a frame
 
     def _loop(self) -> None:
         args = self.args
+        # The .eim model runs as a separate process; the runner talks to it over a
+        # socket and stops it when the `with` block exits.
         with ImageImpulseRunner(str(args.model.resolve())) as runner:
             info = runner.init()
             params = info["model_parameters"]
             model_w, model_h = params["image_input_width"], params["image_input_height"]
+            resize_mode = params.get("image_resize_mode", "fit-shortest")
             logging.info(
-                "Model: %s v%s | %dx%d | labels %s",
-                info["project"]["name"], info["project"]["deploy_version"], model_w, model_h, params["labels"],
+                "Model: %s v%s | %dx%d %s | labels %s",
+                info["project"]["name"], info["project"]["deploy_version"],
+                model_w, model_h, resize_mode, params["labels"],
             )
+            missing = {TOP_LABEL, BOTTOM_LABEL} - set(params["labels"])
+            if missing:
+                logging.warning("Model has no %s label(s); those points will never be detected", sorted(missing))
+            set_model_threshold(runner, params, args.min_confidence)
 
             picam2 = start_camera(args.size)
             try:
                 frame_w, frame_h = picam2.camera_configuration()["main"]["size"]
+                region = model_region(frame_w, frame_h, resize_mode)
                 logging.info("Camera: %dx%d frames", frame_w, frame_h)
-                self.ready.set()
 
                 smoothing = not args.no_smoothing
                 trackers = {
                     label: PointTracker(args.min_cutoff, args.beta, args.hold_frames, enabled=smoothing)
                     for label in (TOP_LABEL, BOTTOM_LABEL)
                 }
+                # Raw measurement per label: refined (neighbour-averaged) or plain strongest cell.
+                measure = refined_point if smoothing else strongest
                 logging.info(
                     "Jitter reduction: %s",
                     f"on (min_cutoff={args.min_cutoff}, beta={args.beta}, hold={args.hold_frames} frames)"
                     if smoothing else "off",
                 )
+                self.ready.set()
 
                 fps = 0.0
                 last = time.perf_counter()
                 while not self.stop_event.is_set():
-                    frame = picam2.capture_array("main")  # BGR
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    # ---- 1. capture
+                    frame = picam2.capture_array("main")  # BGR numpy array, shape (h, w, 3)
+                    t_frame = time.perf_counter()         # timestamp for the smoothing filters
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # the model expects RGB
 
-                    t0 = time.perf_counter()
+                    # ---- 2. inference (crop/resize exactly as configured in Studio, then classify)
                     features, _cropped = runner.get_features_from_image_auto_studio_settings(rgb)
                     result = runner.classify(features)
-                    infer_ms = (time.perf_counter() - t0) * 1000
+                    infer_ms = (time.perf_counter() - t_frame) * 1000
 
-                    now = time.perf_counter()
-                    points = extract_points(result, frame_w, frame_h, model_w, model_h, args.min_confidence)
-                    measure = refined_point if smoothing else strongest
+                    # ---- 3. points: raw cells -> per-label measurement -> smoothed/held
+                    points = extract_points(result, region, model_w, model_h)
                     raw_top, raw_bottom = measure(points, TOP_LABEL), measure(points, BOTTOM_LABEL)
-                    top = trackers[TOP_LABEL].update(raw_top, now)
-                    bottom = trackers[BOTTOM_LABEL].update(raw_bottom, now)
+                    top = trackers[TOP_LABEL].update(raw_top, t_frame)
+                    bottom = trackers[BOTTOM_LABEL].update(raw_bottom, t_frame)
                     pose = pen_pose(top, bottom) if top and bottom else None
 
-                    fps = 0.9 * fps + 0.1 * (1.0 / max(now - last, 1e-6)) if fps else 1.0 / max(now - last, 1e-6)
-                    last = now
+                    # ---- 4. frame rate: exponential moving average of 1/frame-time
+                    instant_fps = 1.0 / max(t_frame - last, 1e-6)
+                    fps = 0.9 * fps + 0.1 * instant_fps if fps else instant_fps
+                    last = t_frame
 
-                    draw_overlay(frame, points, top, bottom, pose, fps, infer_ms)
+                    # ---- 5. overlay + JPEG for the stream
+                    draw_overlay(frame, region, points, top, bottom, pose, fps, infer_ms)
                     ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, args.jpeg_quality])
 
-                    def rounded(p: Point | None) -> dict | None:
-                        if p is None:
-                            return None
-                        d = asdict(p)
-                        d.update(x=round(p.x, 1), y=round(p.y, 1), confidence=round(p.confidence, 3), size=round(p.size, 1))
-                        return d
-
+                    # ---- 6. publish (JSON layout documented in the README)
                     latest = {
                         "timestamp": time.time(),
                         "frame_size": [frame_w, frame_h],
@@ -491,19 +632,19 @@ class Detector(threading.Thread):
                         "smoothing": smoothing,
                         # top/bottom/pose are the smoothed values (use these for control);
                         # raw_* are this frame's unsmoothed measurements.
-                        "top": rounded(top),
-                        "bottom": rounded(bottom),
+                        "top": point_json(top),
+                        "bottom": point_json(bottom),
                         "pose": {k: round(v, 1) for k, v in asdict(pose).items()} if pose else None,
-                        "raw_top": rounded(raw_top),
-                        "raw_bottom": rounded(raw_bottom),
-                        "all_points": [rounded(p) for p in points],
+                        "raw_top": point_json(raw_top),
+                        "raw_bottom": point_json(raw_bottom),
+                        "all_points": [point_json(p) for p in points],
                     }
                     with self.cond:
                         if ok:
                             self.jpeg = buf.tobytes()
                         self.latest = latest
                         self.frame_id += 1
-                        self.cond.notify_all()
+                        self.cond.notify_all()  # wake /stream handlers waiting for a new frame
 
                     if args.print_results and (top or bottom):
                         msg = " | ".join(f"{p.label} ({p.x:.0f},{p.y:.0f}) {p.confidence:.2f}" for p in (top, bottom) if p)
@@ -511,18 +652,24 @@ class Detector(threading.Thread):
                             msg += f" | center ({pose.center_x:.0f},{pose.center_y:.0f}) angle {pose.angle_deg:.1f}"
                         print(msg, flush=True)
             finally:
+                # Always release the camera, even after errors.
                 picam2.stop()
                 picam2.close()
 
     def wait_for_frame(self, last_id: int, timeout: float = 2.0) -> tuple[int, bytes | None]:
+        """Block until a frame newer than last_id exists (or timeout/stop/error).
+
+        Returns (current frame id, latest JPEG). Called from web handler threads.
+        """
         with self.cond:
             self.cond.wait_for(lambda: self.frame_id != last_id or self.stop_event.is_set() or self.error, timeout)
             return self.frame_id, self.jpeg
 
 
-# --------------------------------------------------------------------------- web
+# =========================================================================== web server
 
-
+# Viewer page: the <img> shows the MJPEG stream; the script polls
+# /api/detections 5x per second and fills in the summary panel.
 PAGE = """<!doctype html>
 <html lang="en">
 <head>
@@ -586,6 +733,7 @@ PAGE = """<!doctype html>
 
 
 def create_app(detector: Detector) -> Flask:
+    """Build the Flask app. Handlers only read the detector's shared state."""
     app = Flask(__name__)
 
     @app.get("/")
@@ -594,6 +742,8 @@ def create_app(detector: Detector) -> Flask:
 
     @app.get("/stream")
     def stream():
+        # MJPEG: one long HTTP response made of JPEG "parts" separated by a
+        # boundary marker; browsers show it as live video in a plain <img>.
         def frames():
             last_id = -1
             while not detector.stop_event.is_set() and detector.error is None:
@@ -605,7 +755,7 @@ def create_app(detector: Detector) -> Flask:
 
     @app.get("/snapshot.jpg")
     def snapshot():
-        _, jpeg = detector.wait_for_frame(-1, timeout=0)
+        _, jpeg = detector.wait_for_frame(-1, timeout=0)  # don't wait; just take the latest
         if not jpeg:
             return "no frame yet", 503
         return Response(jpeg, mimetype="image/jpeg")
@@ -618,32 +768,43 @@ def create_app(detector: Detector) -> Flask:
     return app
 
 
-# --------------------------------------------------------------------------- main
+# =========================================================================== main
 
 
-def main() -> None:
+def handle_sigterm(signum, frame) -> None:
+    """Treat `kill` / `pkill` (SIGTERM) like Ctrl+C so cleanup code runs."""
+    raise KeyboardInterrupt
+
+
+def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
     logging.getLogger("werkzeug").setLevel(logging.WARNING)  # hide per-request logs
     args = parse_args()
+    signal.signal(signal.SIGTERM, handle_sigterm)
 
     detector = Detector(args)
-    # Stop cleanly on Ctrl+C or `kill` (SIGTERM), releasing the camera and model.
-    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
-    detector.start()
-    detector.ready.wait()
-    if detector.error:
-        raise SystemExit(f"Detector failed to start: {detector.error}")
-
-    logging.info("Streaming on http://%s:%d  (Ctrl+C to stop)", args.host, args.port)
     try:
+        # Start the camera/model thread and wait until it is streaming (or failed).
+        detector.start()
+        detector.ready.wait()
+        if detector.error:
+            logging.error("Detector failed to start: %s", detector.error)
+            return 1
+
+        logging.info("Streaming on http://%s:%d  (Ctrl+C to stop)", args.host, args.port)
+        # Flask's built-in server; threaded=True gives each viewer its own thread.
+        # Blocks until Ctrl+C / SIGTERM / a detector crash (KeyboardInterrupt).
         create_app(detector).run(host=args.host, port=args.port, threaded=True, use_reloader=False)
     except KeyboardInterrupt:
         pass
     finally:
+        # Ask the detector loop to exit; it releases the camera and model itself.
         detector.stop_event.set()
-        detector.join(timeout=5)
+        if detector.is_alive():
+            detector.join(timeout=5)
         logging.info("Stopped.")
+    return 1 if detector.error else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

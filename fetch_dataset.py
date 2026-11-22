@@ -22,6 +22,7 @@ DEFAULT_HOST = "pi"
 # Relative to the Pi user's home directory (scp resolves relative remote paths from there).
 DEFAULT_REMOTE_DATASET = "picamera_test/dataset"
 
+# Never prompt for a password; give up quickly if the Pi is unreachable.
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
 
 
@@ -37,6 +38,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def count_images(root: Path) -> dict[str, int]:
+    """Return {label: number of .jpg files} for each label folder under root."""
     if not root.is_dir():
         return {}
     return {d.name: len(list(d.glob("*.jpg"))) for d in sorted(root.iterdir()) if d.is_dir()}
@@ -48,8 +50,8 @@ def main() -> int:
     local_dataset.mkdir(exist_ok=True)
 
     print(f"Copying {args.host}:{args.remote_dataset}/ -> {local_dataset}")
-    # Copy the folder's contents (".../.") so they merge into ./dataset/ instead of
-    # creating ./dataset/dataset/.
+    # Copy the folder's *contents* ("<dir>/.") so they merge into ./dataset/
+    # instead of creating ./dataset/dataset/.  -r = recursive, -q = no progress bars.
     result = subprocess.run(
         ["scp", "-r", "-q", *SSH_OPTS, f"{args.host}:{args.remote_dataset}/.", str(local_dataset)]
     )

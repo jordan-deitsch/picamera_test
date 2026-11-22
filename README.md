@@ -23,6 +23,8 @@ Development happens on a Windows PC. Code reaches the Pi through GitHub, and the
 | [`upload_dataset.py`](upload_dataset.py) | PC | Upload `dataset/` to an Edge Impulse project |
 | [`live_detect.py`](live_detect.py) | Pi | Run the FOMO model on the live camera feed and stream it with overlays to a web page |
 
+Each script starts with a docstring explaining what it does and how to run it. `live_detect.py`'s docstring also has an **architecture overview** (threads, data flow, processing steps), which is the best place to start reading the code.
+
 Git ignores `captures/`, `dataset/`, `models/`, and `.venv/`, so images, model files, and the virtual environment never go into the repo.
 
 ---
@@ -265,7 +267,7 @@ Options:
 |---|---|---|
 | `--model` | newest `models/*.eim` | Path to a specific model |
 | `--size` | `640x480` | Camera frame size. Keep it the same as the training images |
-| `--min-confidence` | `0.5` | Ignore weaker detections |
+| `--min-confidence` | `0.5` | Detection threshold (0–1), set inside the model. Lower it (e.g. `0.3`) if a point flickers out; raise it to cut false detections |
 | `--port` | `8000` | Web server port |
 | `--jpeg-quality` | `80` | Stream quality versus bandwidth |
 | `--print` | – | Also print detections to the console |
@@ -329,7 +331,8 @@ Labels sit to the upper right of their point, and flip to the **left** (and belo
 
 ### Performance and framing notes
 - On the Pi 4 the 96x96 FOMO model takes about **5 ms per frame**. The stream runs at the camera's **30 FPS**, leaving most of the processor free for robot control.
-- The model uses the **fit-shortest** resize mode: each frame is center-cropped to a square (480x480 from 640x480) and scaled to 96x96. The script maps the detections back to full-frame pixels.
+- The model uses the **fit-shortest** resize mode: each frame is center-cropped to a square (480x480 from 640x480) and scaled to 96x96. The script reads the resize mode from the model and maps detections back to full-frame pixels. It also supports **fit-longest** and **squash**, in case you change the setting in Studio.
+- If the camera or model fails while streaming, the script exits with an error rather than serving a frozen image. It exits with code 1, so it's safe to build robot control on.
 - The script forces a **full-field-of-view sensor mode** (2304x1296). On the Camera Module 3, the faster 1536x864 mode is a center crop, which would zoom in compared to the training images.
 - The web page has no login. Use it only on your home network; for remote access, use a VPN such as Tailscale instead of opening a port on your router.
 

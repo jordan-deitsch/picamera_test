@@ -27,8 +27,9 @@ from pathlib import Path
 import requests
 
 PROJECT_DIR = Path(__file__).resolve().parent
+# Edge Impulse ingestion endpoint; {category} is "training", "testing" or "split".
 INGESTION_URL = "https://ingestion.edgeimpulse.com/api/{category}/files"
-BATCH_SIZE = 20  # files per request
+BATCH_SIZE = 20  # files per HTTP request (keeps each request a reasonable size)
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,6 +52,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def find_images(dataset_dir: Path, labels: list[str] | None) -> dict[str, list[Path]]:
+    """Return {label: [image paths]} for each dataset/<label>/ folder that has .jpg files."""
     if not dataset_dir.is_dir():
         raise SystemExit(f"No dataset folder at {dataset_dir}. Run fetch_dataset.py first.")
     found = {}
@@ -64,7 +66,11 @@ def find_images(dataset_dir: Path, labels: list[str] | None) -> dict[str, list[P
 
 
 def upload_batch(api_key: str, category: str, label: str, paths: list[Path]) -> tuple[int, list[str]]:
-    """Upload one batch; return (number accepted, list of error messages)."""
+    """Upload one batch of images (multipart form, one "data" field per file).
+
+    Returns (number of files accepted, list of error messages). Errors for a whole
+    request start with "HTTP"/"Request"; per-file errors (e.g. duplicates) don't.
+    """
     handles = [open(p, "rb") for p in paths]
     try:
         files = [("data", (p.name, h, "image/jpeg")) for p, h in zip(paths, handles)]
@@ -79,6 +85,9 @@ def upload_batch(api_key: str, category: str, label: str, paths: list[Path]) -> 
             files=files,
             timeout=120,
         )
+    except requests.RequestException as exc:
+        # Network problem (no internet, DNS, timeout): report it and let the caller continue.
+        return 0, [f"Request failed: {exc}"]
     finally:
         for h in handles:
             h.close()
@@ -86,7 +95,12 @@ def upload_batch(api_key: str, category: str, label: str, paths: list[Path]) -> 
     if response.status_code != 200:
         return 0, [f"HTTP {response.status_code}: {response.text[:300]}"]
 
-    body = response.json()
+    try:
+        body = response.json()
+    except ValueError:
+        return 0, [f"HTTP 200 but response was not JSON: {response.text[:300]}"]
+
+    # The response lists each file with its own success flag.
     errors = []
     accepted = 0
     for item in body.get("files", []):
@@ -121,6 +135,7 @@ def main() -> int:
     uploaded = 0
     all_errors = []
     for label, paths in images.items():
+        # Send each label's images in batches of BATCH_SIZE.
         for start in range(0, len(paths), BATCH_SIZE):
             batch = paths[start : start + BATCH_SIZE]
             accepted, errors = upload_batch(api_key, args.category, label, batch)
@@ -129,12 +144,16 @@ def main() -> int:
             print(f"  {label}: {min(start + BATCH_SIZE, len(paths))}/{len(paths)} sent, {accepted} accepted")
 
     print(f"Uploaded {uploaded}/{total} image(s).")
+    # Whole-request failures (bad API key, network, server error) vs. per-file
+    # rejections (mostly duplicates, which are expected when re-running).
+    request_failed = any(err.startswith(("HTTP ", "Request failed")) for err in all_errors)
     if all_errors:
-        print(f"{len(all_errors)} not uploaded (duplicates are expected on re-runs):")
+        note = "" if request_failed else " (duplicates are expected on re-runs)"
+        print(f"{len(all_errors)} error(s){note}:")
         for err in all_errors[:20]:
             print(f"  {err}")
-    # Fail if a whole request was rejected (e.g. bad API key); per-file duplicates are fine.
-    return 1 if any(err.startswith("HTTP ") for err in all_errors) else 0
+    # Exit code 1 only if a whole request failed; skipped duplicates count as success.
+    return 1 if request_failed else 0
 
 
 if __name__ == "__main__":
