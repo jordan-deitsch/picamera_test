@@ -8,7 +8,14 @@ Then open http://<pi-ip-address>:8000 in a browser on the same network.
 
 Pipeline (one background thread):
     Picamera2 frame (640x480) -> center square crop -> 96x96 -> FOMO model
-      -> best "pen_top" and "pen_bottom" centroids, mapped back to frame pixels
+      -> "pen_top" / "pen_bottom" cell centroids, mapped back to frame pixels
+      -> jitter reduction:
+           1. spatial: confidence-weighted average of the strongest cell and its
+              neighbouring cells of the same label (sub-cell precision instead of
+              snapping to FOMO's coarse grid)
+           2. temporal: One Euro filter per point (smooth when still, responsive
+              when moving), plus a short hold so a point that drops out for a
+              frame or two doesn't flicker
       -> overlay: both points, a line between them, the pen's center point,
          and its orientation angle
       -> JPEG -> web page (MJPEG stream) + JSON API
@@ -66,6 +73,8 @@ class Point:
     x: float          # frame pixel coordinates (origin top-left)
     y: float
     confidence: float
+    size: float = 0.0  # FOMO cell size in frame pixels
+    held: bool = False  # True if not detected this frame and showing the last position
 
 
 @dataclass
@@ -106,6 +115,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8000, help="Web server port (default: 8000)")
     parser.add_argument("--jpeg-quality", type=int, default=80, help="Stream JPEG quality (default: 80)")
     parser.add_argument("--print", dest="print_results", action="store_true", help="Also print detections to the console")
+
+    smooth = parser.add_argument_group("jitter reduction")
+    smooth.add_argument(
+        "--no-smoothing",
+        action="store_true",
+        help="Disable all jitter reduction (raw strongest cell per label, no filtering or hold)",
+    )
+    smooth.add_argument(
+        "--min-cutoff",
+        type=float,
+        default=0.5,
+        help="One Euro filter cutoff (Hz) when still. Lower = smoother but laggier (default: 0.5)",
+    )
+    smooth.add_argument(
+        "--beta",
+        type=float,
+        default=0.01,
+        help="One Euro filter speed coefficient. Higher = less lag when moving, more jitter (default: 0.01)",
+    )
+    smooth.add_argument(
+        "--hold-frames",
+        type=int,
+        default=5,
+        help="Keep showing a point for this many frames after it is lost (default: 5)",
+    )
     args = parser.parse_args()
 
     args.model = args.model or newest_model()
@@ -161,16 +195,103 @@ def extract_points(result: dict, frame_w: int, frame_h: int, model_w: int, model
             continue
         cx = (box["x"] + box["width"] / 2) * sx + x0
         cy = (box["y"] + box["height"] / 2) * sy + y0
-        points.append(Point(box["label"], cx, cy, box["value"]))
+        points.append(Point(box["label"], cx, cy, box["value"], size=box["width"] * sx))
     return points
 
 
-def best_per_label(points: list[Point]) -> dict[str, Point]:
-    best: dict[str, Point] = {}
-    for p in points:
-        if p.label not in best or p.confidence > best[p.label].confidence:
-            best[p.label] = p
-    return best
+def strongest(points: list[Point], label: str) -> Point | None:
+    candidates = [p for p in points if p.label == label]
+    return max(candidates, key=lambda p: p.confidence) if candidates else None
+
+
+def refined_point(points: list[Point], label: str, radius_cells: float = 1.5) -> Point | None:
+    """Spatial jitter reduction: confidence-weighted centroid of the strongest cell
+    and its neighbouring same-label cells (within radius_cells cell widths).
+
+    FOMO usually lights up 1-4 adjacent cells per object. Averaging them places the
+    point between grid cells instead of jumping from cell to cell. Cells further
+    away are treated as separate objects/false positives and ignored.
+    """
+    best = strongest(points, label)
+    if best is None:
+        return None
+    radius = radius_cells * best.size
+    near = [p for p in points if p.label == label and math.hypot(p.x - best.x, p.y - best.y) <= radius]
+    weight = sum(p.confidence for p in near)
+    return Point(
+        label,
+        sum(p.x * p.confidence for p in near) / weight,
+        sum(p.y * p.confidence for p in near) / weight,
+        best.confidence,
+        best.size,
+    )
+
+
+class OneEuroFilter:
+    """One Euro filter (Casiez et al., 2012): a low-pass filter whose cutoff rises
+    with speed. Still objects get heavy smoothing (no jitter); moving objects get
+    light smoothing (little lag)."""
+
+    def __init__(self, min_cutoff: float, beta: float, d_cutoff: float = 1.0):
+        self.min_cutoff, self.beta, self.d_cutoff = min_cutoff, beta, d_cutoff
+        self.x_prev: float | None = None
+        self.dx_prev = 0.0
+        self.t_prev = 0.0
+
+    @staticmethod
+    def _alpha(dt: float, cutoff: float) -> float:
+        tau = 1.0 / (2 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def reset(self) -> None:
+        self.x_prev = None
+
+    def __call__(self, x: float, t: float) -> float:
+        if self.x_prev is None:
+            self.x_prev, self.dx_prev, self.t_prev = x, 0.0, t
+            return x
+        dt = t - self.t_prev
+        if dt <= 0:
+            return self.x_prev
+        dx = (x - self.x_prev) / dt
+        a_d = self._alpha(dt, self.d_cutoff)
+        dx_hat = a_d * dx + (1 - a_d) * self.dx_prev
+        a = self._alpha(dt, self.min_cutoff + self.beta * abs(dx_hat))
+        x_hat = a * x + (1 - a) * self.x_prev
+        self.x_prev, self.dx_prev, self.t_prev = x_hat, dx_hat, t
+        return x_hat
+
+
+class PointTracker:
+    """Temporal jitter reduction for one label: One Euro filter on x and y, and a
+    short hold so brief detection dropouts don't make the point flicker."""
+
+    def __init__(self, min_cutoff: float, beta: float, hold_frames: int, enabled: bool = True):
+        self.enabled = enabled
+        self.hold_frames = hold_frames if enabled else 0
+        self.fx = OneEuroFilter(min_cutoff, beta)
+        self.fy = OneEuroFilter(min_cutoff, beta)
+        self.last: Point | None = None
+        self.missed = 0
+
+    def update(self, p: Point | None, t: float) -> Point | None:
+        if p is not None:
+            self.missed = 0
+            if self.enabled:
+                p = Point(p.label, self.fx(p.x, t), self.fy(p.y, t), p.confidence, p.size)
+            self.last = p
+            return p
+
+        self.missed += 1
+        if self.last is not None and self.missed <= self.hold_frames:
+            held = Point(**{**asdict(self.last), "held": True})
+            return held
+        # Lost for too long: forget it so the next detection starts fresh
+        # instead of sliding in from the old position.
+        self.last = None
+        self.fx.reset()
+        self.fy.reset()
+        return None
 
 
 def pen_pose(top: Point, bottom: Point) -> PenPose:
@@ -196,33 +317,75 @@ def put_text(img, text: str, org: tuple[int, int], color=COLOR_TEXT, scale: floa
     cv2.putText(img, text, (x, y), font, scale, color, 1, cv2.LINE_AA)
 
 
-def draw_overlay(frame, points: list[Point], best: dict[str, Point], pose: PenPose | None, fps: float, infer_ms: float) -> None:
+def put_label(img, text: str, anchor: tuple[int, int], color, below: bool = False, gap: int = 10, scale: float = 0.5) -> None:
+    """Text label next to a point that always stays fully inside the frame.
+
+    Placed to the right of the anchor when there is room; flipped to the LEFT when
+    it would run off the right edge. Placed above (or below, if below=True) and
+    flipped vertically at the top/bottom edges. Finally clamped to the frame.
+    """
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), baseline = cv2.getTextSize(text, font, scale, 1)
+    img_h, img_w = img.shape[:2]
+    ax, ay = anchor
+    pad = 2
+
+    # Horizontal: right of the point, or left if it would overflow the right edge.
+    x = ax + gap
+    if x + tw + pad > img_w:
+        x = ax - gap - tw
+    x = max(pad, min(x, img_w - tw - pad))
+
+    # Vertical (y is the text baseline): above or below, flipping at the edges.
+    above_y, below_y = ay - gap, ay + gap + th
+    y = below_y if below else above_y
+    if y - th - 2 * pad < 0:
+        y = below_y
+    elif y + baseline + pad > img_h:
+        y = above_y
+    y = max(th + 2 * pad, min(y, img_h - baseline - pad))
+
+    cv2.rectangle(img, (x - pad, y - th - 2 * pad), (x + tw + pad, y + baseline), (0, 0, 0), cv2.FILLED)
+    cv2.putText(img, text, (x, y), font, scale, color, 1, cv2.LINE_AA)
+
+
+def draw_overlay(
+    frame,
+    raw_points: list[Point],
+    top: Point | None,
+    bottom: Point | None,
+    pose: PenPose | None,
+    fps: float,
+    infer_ms: float,
+) -> None:
     h, w = frame.shape[:2]
     x0, y0, side = model_crop(w, h)
     cv2.rectangle(frame, (x0, y0), (x0 + side - 1, y0 + side - 1), COLOR_CROP, 1)
 
-    # Weaker extra detections (other FOMO cells) as small hollow dots.
-    for p in points:
-        if best.get(p.label) is not p:
-            color = COLOR_TOP if p.label == TOP_LABEL else COLOR_BOTTOM
-            cv2.circle(frame, (round(p.x), round(p.y)), 4, color, 1, cv2.LINE_AA)
-
-    top, bottom = best.get(TOP_LABEL), best.get(BOTTOM_LABEL)
+    # Raw FOMO cells for this frame as small hollow dots (shows what was smoothed).
+    for p in raw_points:
+        color = COLOR_TOP if p.label == TOP_LABEL else COLOR_BOTTOM
+        cv2.circle(frame, (round(p.x), round(p.y)), 4, color, 1, cv2.LINE_AA)
 
     if pose is not None:
         cv2.line(frame, (round(bottom.x), round(bottom.y)), (round(top.x), round(top.y)), COLOR_LINE, 2, cv2.LINE_AA)
         c = (round(pose.center_x), round(pose.center_y))
         cv2.drawMarker(frame, c, COLOR_CENTER, cv2.MARKER_CROSS, 18, 2, cv2.LINE_AA)
         cv2.circle(frame, c, 5, COLOR_CENTER, 1, cv2.LINE_AA)
-        put_text(frame, f"center ({c[0]}, {c[1]})", (c[0] + 12, c[1] + 18), COLOR_CENTER)
+        put_label(frame, f"center ({c[0]}, {c[1]})", c, COLOR_CENTER, below=True)
 
     for p, color, name in ((top, COLOR_TOP, "top"), (bottom, COLOR_BOTTOM, "bottom")):
         if p is None:
             continue
         pt = (round(p.x), round(p.y))
-        cv2.circle(frame, pt, 7, color, cv2.FILLED, cv2.LINE_AA)
-        cv2.circle(frame, pt, 7, (0, 0, 0), 1, cv2.LINE_AA)
-        put_text(frame, f"{name} ({pt[0]}, {pt[1]}) {p.confidence:.2f}", (pt[0] + 10, pt[1] - 10), color)
+        if p.held:  # not detected this frame: hollow marker
+            cv2.circle(frame, pt, 7, color, 2, cv2.LINE_AA)
+            text = f"{name} ({pt[0]}, {pt[1]}) held"
+        else:
+            cv2.circle(frame, pt, 7, color, cv2.FILLED, cv2.LINE_AA)
+            cv2.circle(frame, pt, 7, (0, 0, 0), 1, cv2.LINE_AA)
+            text = f"{name} ({pt[0]}, {pt[1]}) {p.confidence:.2f}"
+        put_label(frame, text, pt, color)
 
     put_text(frame, f"{fps:4.1f} FPS | inference {infer_ms:4.1f} ms", (8, 20))
     if pose is not None:
@@ -277,6 +440,17 @@ class Detector(threading.Thread):
                 logging.info("Camera: %dx%d frames", frame_w, frame_h)
                 self.ready.set()
 
+                smoothing = not args.no_smoothing
+                trackers = {
+                    label: PointTracker(args.min_cutoff, args.beta, args.hold_frames, enabled=smoothing)
+                    for label in (TOP_LABEL, BOTTOM_LABEL)
+                }
+                logging.info(
+                    "Jitter reduction: %s",
+                    f"on (min_cutoff={args.min_cutoff}, beta={args.beta}, hold={args.hold_frames} frames)"
+                    if smoothing else "off",
+                )
+
                 fps = 0.0
                 last = time.perf_counter()
                 while not self.stop_event.is_set():
@@ -288,27 +462,41 @@ class Detector(threading.Thread):
                     result = runner.classify(features)
                     infer_ms = (time.perf_counter() - t0) * 1000
 
+                    now = time.perf_counter()
                     points = extract_points(result, frame_w, frame_h, model_w, model_h, args.min_confidence)
-                    best = best_per_label(points)
-                    top, bottom = best.get(TOP_LABEL), best.get(BOTTOM_LABEL)
+                    measure = refined_point if smoothing else strongest
+                    raw_top, raw_bottom = measure(points, TOP_LABEL), measure(points, BOTTOM_LABEL)
+                    top = trackers[TOP_LABEL].update(raw_top, now)
+                    bottom = trackers[BOTTOM_LABEL].update(raw_bottom, now)
                     pose = pen_pose(top, bottom) if top and bottom else None
 
-                    now = time.perf_counter()
                     fps = 0.9 * fps + 0.1 * (1.0 / max(now - last, 1e-6)) if fps else 1.0 / max(now - last, 1e-6)
                     last = now
 
-                    draw_overlay(frame, points, best, pose, fps, infer_ms)
+                    draw_overlay(frame, points, top, bottom, pose, fps, infer_ms)
                     ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, args.jpeg_quality])
+
+                    def rounded(p: Point | None) -> dict | None:
+                        if p is None:
+                            return None
+                        d = asdict(p)
+                        d.update(x=round(p.x, 1), y=round(p.y, 1), confidence=round(p.confidence, 3), size=round(p.size, 1))
+                        return d
 
                     latest = {
                         "timestamp": time.time(),
                         "frame_size": [frame_w, frame_h],
                         "fps": round(fps, 1),
                         "inference_ms": round(infer_ms, 1),
-                        "top": asdict(top) if top else None,
-                        "bottom": asdict(bottom) if bottom else None,
+                        "smoothing": smoothing,
+                        # top/bottom/pose are the smoothed values (use these for control);
+                        # raw_* are this frame's unsmoothed measurements.
+                        "top": rounded(top),
+                        "bottom": rounded(bottom),
                         "pose": {k: round(v, 1) for k, v in asdict(pose).items()} if pose else None,
-                        "all_points": [asdict(p) for p in points],
+                        "raw_top": rounded(raw_top),
+                        "raw_bottom": rounded(raw_bottom),
+                        "all_points": [rounded(p) for p in points],
                     }
                     with self.cond:
                         if ok:
@@ -375,7 +563,7 @@ PAGE = """<!doctype html>
   </div>
 </main>
 <script>
-  const fmt = p => p ? `(${p.x.toFixed(0)}, ${p.y.toFixed(0)})  ${(p.confidence * 100).toFixed(0)}%` : "not found";
+  const fmt = p => p ? `(${p.x.toFixed(0)}, ${p.y.toFixed(0)})  ${p.held ? "held" : (p.confidence * 100).toFixed(0) + "%"}` : "not found";
   const set = (id, v) => document.getElementById(id).textContent = v;
   async function poll() {
     try {

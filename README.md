@@ -269,19 +269,50 @@ Options:
 | `--port` | `8000` | Web server port |
 | `--jpeg-quality` | `80` | Stream quality versus bandwidth |
 | `--print` | – | Also print detections to the console |
+| `--no-smoothing` | – | Turn off all jitter reduction (raw strongest cell per label) |
+| `--min-cutoff` | `0.5` | One Euro filter: smoothing while still. Lower = steadier, but more lag |
+| `--beta` | `0.01` | One Euro filter: response to motion. Higher = less lag when moving, more jitter |
+| `--hold-frames` | `5` | Keep showing a point for this many frames after it's lost |
+
+### Jitter reduction
+
+FOMO detects on a coarse grid. Each cell is 8x8 model pixels, about **40 frame pixels**, so raw points snap between grid cells and flicker when a detection drops for a frame. `live_detect.py` applies three fixes to each label (`pen_top`, `pen_bottom`). The center point and angle are then calculated from the smoothed points:
+
+1. **Within a frame (sub-cell precision):** FOMO usually marks 1–4 neighboring cells for one object. The point is the confidence-weighted average of the strongest cell and its neighbors (within 1.5 cells), so it can land between grid cells. Cells further away are ignored, as a separate object or a false detection.
+2. **Over time (One Euro filter):** a smoothing filter that adapts to speed. When the pen is still, it smooths heavily, which removes jitter. When the pen moves, it smooths less, which keeps lag low.
+3. **Dropout hold:** if a point isn't detected for up to `--hold-frames` frames, its last position stays on screen with a **hollow** marker labeled `held`, instead of disappearing. After that it's cleared, so the next detection starts fresh rather than sliding in from the old position.
+
+In a simulation of FOMO's grid output at 30 FPS, these cut a still pen's jitter by roughly 60–70%. They also filled every gap when 15% of frames had no detection.
+
+**Tuning on the real setup:**
+- **Steadier while still:** lower `--min-cutoff` (e.g. `0.3`).
+- **Less lag when moving:** raise `--beta` (e.g. `0.02`).
+- **Compare with the raw output:** run with `--no-smoothing`.
+
+The simulation showed this trade-off:
+
+| `--min-cutoff` / `--beta` | Still jitter | Lag at ~160 px/s |
+|---|---|---|
+| 0.3 / 0.005 | ~6 px | ~11 px |
+| **0.5 / 0.01 (default)** | **~7 px** | **~7 px** |
+| 1.0 / 0.02 | ~9 px | ~4 px |
+| raw (`--no-smoothing`) | ~20 px | – |
 
 ### What the overlay shows
 
 | Element | Meaning |
 |---|---|
-| Green dot | `pen_top`: the strongest detection, with its frame coordinates and confidence |
+| Green dot | `pen_top`: smoothed position, with its frame coordinates and confidence |
 | Orange dot | `pen_bottom`: the same, for the bottom |
-| Small hollow dots | Weaker extra detections. FOMO can mark several neighboring cells for one object |
+| Hollow green/orange ring with `held` | That point wasn't detected this frame; showing its last position |
+| Small hollow dots | This frame's raw FOMO cells, before smoothing |
 | Cyan line | Bottom → top: the pen's orientation |
 | Magenta crosshair | The pen's center (midpoint of top and bottom) |
 | Gray square | The center square of the frame that the model actually sees. Objects outside it aren't detected |
 | Top-left | Stream FPS and model inference time |
 | Bottom-left | Orientation angle and length in pixels, or which point is missing |
+
+Labels sit to the upper right of their point, and flip to the **left** (and below, at the top edge) when they would run off the image, so they're always fully visible.
 
 **Angle convention:** the direction from bottom to top, in degrees, counter-clockwise from pointing right, with "up" on screen positive. **90°** = top pointing straight up, **0°** = right, **180°** = left, **−90°** = down. All coordinates are frame pixels with the origin at the top-left (y increases downward).
 
@@ -292,7 +323,7 @@ Options:
 | `/` | Viewer page: live stream plus live coordinates, angle, and FPS |
 | `/stream` | MJPEG video with overlays |
 | `/snapshot.jpg` | One annotated frame |
-| `/api/detections` | Latest result as JSON (`top`, `bottom`, `pose`, `fps`, `inference_ms`, `all_points`). Intended for robot control later |
+| `/api/detections` | Latest result as JSON. Intended for robot control later. `top`, `bottom`, and `pose` are the **smoothed** values to use for control. Each point has `x`, `y`, `confidence`, `size`, and `held`. `raw_top` / `raw_bottom` are this frame's unsmoothed measurements. Also includes `all_points` (raw FOMO cells), `smoothing`, `fps`, and `inference_ms` |
 
 ### Performance and framing notes
 - On the Pi 4 the 96x96 FOMO model takes about **5 ms per frame**. The stream runs at the camera's **30 FPS**, leaving most of the processor free for robot control.
