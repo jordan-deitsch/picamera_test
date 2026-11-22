@@ -302,7 +302,7 @@ The simulation showed this trade-off:
 
 | Element | Meaning |
 |---|---|
-| Green dot | `pen_top`: smoothed position, with its frame coordinates and confidence |
+| Green dot | `pen_top`: smoothed position, labeled `top` and its confidence |
 | Orange dot | `pen_bottom`: the same, for the bottom |
 | Hollow green/orange ring with `held` | That point wasn't detected this frame; showing its last position |
 | Small hollow dots | This frame's raw FOMO cells, before smoothing |
@@ -311,6 +311,8 @@ The simulation showed this trade-off:
 | Gray square | The center square of the frame that the model actually sees. Objects outside it aren't detected |
 | Top-left | Stream FPS and model inference time |
 | Bottom-left | Orientation angle and length in pixels, or which point is missing |
+
+The video only labels each point with its name and confidence, to keep the image uncluttered. The **coordinates** of the top, bottom, and center points, plus the angle and length, are in the summary panel next to the video and in `/api/detections`.
 
 Labels sit to the upper right of their point, and flip to the **left** (and below, at the top edge) when they would run off the image, so they're always fully visible.
 

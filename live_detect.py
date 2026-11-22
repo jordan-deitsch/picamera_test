@@ -372,7 +372,7 @@ def draw_overlay(
         c = (round(pose.center_x), round(pose.center_y))
         cv2.drawMarker(frame, c, COLOR_CENTER, cv2.MARKER_CROSS, 18, 2, cv2.LINE_AA)
         cv2.circle(frame, c, 5, COLOR_CENTER, 1, cv2.LINE_AA)
-        put_label(frame, f"center ({c[0]}, {c[1]})", c, COLOR_CENTER, below=True)
+        put_label(frame, "center", c, COLOR_CENTER, below=True)
 
     for p, color, name in ((top, COLOR_TOP, "top"), (bottom, COLOR_BOTTOM, "bottom")):
         if p is None:
@@ -380,11 +380,11 @@ def draw_overlay(
         pt = (round(p.x), round(p.y))
         if p.held:  # not detected this frame: hollow marker
             cv2.circle(frame, pt, 7, color, 2, cv2.LINE_AA)
-            text = f"{name} ({pt[0]}, {pt[1]}) held"
+            text = f"{name} held"
         else:
             cv2.circle(frame, pt, 7, color, cv2.FILLED, cv2.LINE_AA)
             cv2.circle(frame, pt, 7, (0, 0, 0), 1, cv2.LINE_AA)
-            text = f"{name} ({pt[0]}, {pt[1]}) {p.confidence:.2f}"
+            text = f"{name} {p.confidence:.2f}"
         put_label(frame, text, pt, color)
 
     put_text(frame, f"{fps:4.1f} FPS | inference {infer_ms:4.1f} ms", (8, 20))
