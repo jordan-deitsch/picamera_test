@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor / OS
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# Camera output and large artifacts (keep out of git; copy with scp/rsync)
+captures/
+output/
+*.h264
+*.mp4
+logs/
+*.log
+
+# Secrets
+.env

@@ -1,0 +1,12 @@
+# Code runs on the Pi (Linux): keep LF line endings in the repo and working tree
+* text=auto eol=lf
+
+# Binary assets
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.h264 binary
+*.mp4 binary
+*.tflite binary
+*.onnx binary
+*.pt binary
