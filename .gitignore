@@ -19,6 +19,7 @@ Thumbs.db
 
 # Camera output and large artifacts (keep out of git; copy with scp/rsync)
 captures/
+dataset/
 output/
 *.h264
 *.mp4
