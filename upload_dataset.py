@@ -196,10 +196,18 @@ def upload_batch(api_key: str, category: str, label: str, paths: list[Path]) -> 
         result.errors.append(f"HTTP 200 but response was not JSON: {response.text[:300]}")
         return result
 
-    # The response lists each file with its own success flag.
-    for item in body.get("files", []):
-        name = item.get("fileName", "?")
+    # The response lists each file, in the order sent, with its own success flag.
+    # Duplicate rejections carry no "fileName", so when there is one entry per
+    # file sent, match entries to files by position; otherwise only by name.
+    items = body.get("files", [])
+    by_position = len(items) == len(paths)
+    for i, item in enumerate(items):
+        name = paths[i].name if by_position else item.get("fileName")
         message = str(item.get("error", "unknown error"))
+        if name is None:
+            # Can't tell which file this is, so leave it pending (safe: it is retried next time).
+            result.errors.append(f"?: {message} (response did not say which file; left pending)")
+            continue
         if item.get("success"):
             result.accepted.append(name)
         elif is_duplicate(message):
