@@ -581,7 +581,10 @@ def run_web(args: argparse.Namespace) -> int:
 
 
 def page_addresses(host: str) -> list[str]:
-    """Addresses a browser can use to reach this Pi, for the startup message."""
+    """Addresses a browser can use to reach this Pi, for the startup message.
+
+    Looked up at run time, so no address is ever stored in the code.
+    """
     if host not in ("0.0.0.0", ""):
         return [host]  # listening on one specific address
     # Listening on all interfaces: list this Pi's IPv4 addresses (Wi-Fi, Ethernet).

@@ -4,7 +4,7 @@
 Runs ON THE RASPBERRY PI, inside the project virtual environment:
     cd ~/picamera_test
     .venv/bin/python live_detect.py
-Then open http://<pi-ip-address>:8000 in a browser on the same network.
+Then open the address it prints (http://<pi-ip-address>:8000) in a browser on the same network.
 
 ARCHITECTURE
 ------------
@@ -45,6 +45,8 @@ import argparse
 import logging
 import math
 import signal
+import socket
+import subprocess
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -771,6 +773,22 @@ def create_app(detector: Detector) -> Flask:
 # =========================================================================== main
 
 
+def page_addresses(host: str) -> list[str]:
+    """Addresses a browser can use to reach this Pi, for the startup message.
+
+    Looked up at run time, so no address is ever stored in the code.
+    """
+    if host not in ("0.0.0.0", ""):
+        return [host]  # listening on one specific address
+    # Listening on all interfaces: list this Pi's IPv4 addresses (Wi-Fi, Ethernet).
+    try:
+        out = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=2).stdout
+        addresses = [a for a in out.split() if "." in a]  # keep IPv4, skip IPv6
+    except (OSError, subprocess.SubprocessError):
+        addresses = []
+    return addresses or [f"{socket.gethostname()}.local"]  # fallback: mDNS name
+
+
 def handle_sigterm(signum, frame) -> None:
     """Treat `kill` / `pkill` (SIGTERM) like Ctrl+C so cleanup code runs."""
     raise KeyboardInterrupt
@@ -791,7 +809,9 @@ def main() -> int:
             logging.error("Detector failed to start: %s", detector.error)
             return 1
 
-        logging.info("Streaming on http://%s:%d  (Ctrl+C to stop)", args.host, args.port)
+        for address in page_addresses(args.host):
+            logging.info("Streaming on http://%s:%d", address, args.port)
+        logging.info("Ctrl+C to stop")
         # Flask's built-in server; threaded=True gives each viewer its own thread.
         # Blocks until Ctrl+C / SIGTERM / a detector crash (KeyboardInterrupt).
         create_app(detector).run(host=args.host, port=args.port, threaded=True, use_reloader=False)
