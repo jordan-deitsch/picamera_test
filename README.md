@@ -171,7 +171,15 @@ Autofocus runs continuously during collection. All three modes use the same came
 ```powershell
 python fetch_dataset.py
 ```
-This copies `~/picamera_test/dataset/` from the Pi into `./dataset/`, keeping the label folders, and prints how many images each label has. It never deletes anything on either machine.
+This copies `~/picamera_test/dataset/` from the Pi into `./dataset/`, keeping the label folders, and prints how many images each label has. By default it never deletes anything on either machine.
+
+To free space on the Pi after copying, add `--delete-remote`:
+```powershell
+python fetch_dataset.py --delete-remote
+```
+After the copy, each image on the Pi is checked against the PC: it must exist at the same path with the same file size. Only verified images are deleted from the Pi. Any that weren't copied, or were captured during the fetch, stay on the Pi and are listed. If the copy fails, nothing is deleted. Label folders are kept, so the collection page still suggests them.
+
+After this, the PC holds the only copy until you upload to Edge Impulse, so back up `dataset/` if it matters. You don't need to delete anything for space: each 640x480 image is about 55 KB, so even thousands of images use only a few hundred MB.
 
 ### 3. Upload to Edge Impulse
 
