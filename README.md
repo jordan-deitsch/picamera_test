@@ -18,7 +18,7 @@ Development happens on a Windows PC. Code reaches the Pi through GitHub, and the
 |---|---|---|
 | [`capture_still.py`](capture_still.py) | Pi | Take one full-resolution still (4608x2592) and save it to `captures/` |
 | [`remote_capture.py`](remote_capture.py) | PC | Run `capture_still.py` on the Pi and copy the image into `captures/` on the PC |
-| [`collect_data.py`](collect_data.py) | Pi | Collect labeled training images into `dataset/<label>/` |
+| [`collect_data.py`](collect_data.py) | Pi | Collect labeled training images into `dataset/<label>/`, from a web page with live video or from the terminal |
 | [`fetch_dataset.py`](fetch_dataset.py) | PC | Copy `dataset/` from the Pi to the PC |
 | [`upload_dataset.py`](upload_dataset.py) | PC | Upload `dataset/` to an Edge Impulse project |
 | [`live_detect.py`](live_detect.py) | Pi | Run the FOMO model on the live camera feed and stream it with overlays to a web page |
@@ -115,9 +115,26 @@ The full process: **collect on the Pi → fetch to the PC → upload to Edge Imp
 
 ### 1. Collect images on the Pi
 
-Images are saved as `dataset/<label>/<label>.<session>_<n>.jpg`.
+Images are saved as `dataset/<label>/<label>.<session>_<n>.jpg`. If the label folder already exists, new images are added to it. File names never clash with earlier runs.
 
-**Interactive mode** (default): press **Enter** to take a picture, and type **`q` + Enter** to quit. Move the object between shots. The `-t` flag is required over SSH so your keypresses reach the Pi:
+**Web mode** (default when you leave out `--label`): live video in the browser, with a form to run collections.
+```powershell
+ssh -t pi "cd ~/picamera_test && python3 collect_data.py"
+```
+Then open `http://<pi-address>:8000` (the same address as live detection). On the page:
+- **Label:** used as the folder name and file prefix. Existing labels are suggested as you type.
+- **Images per run:** defaults to 20.
+- **Seconds between images:** defaults to 1. Use 0 to save every frame.
+- **Start** begins the run. The first image is taken immediately.
+- **Stop** ends a run early.
+
+The counter shows `saved / total` for the current run, and the video border flashes green on each new image. The panel also shows the folder, the number of images now in it, and the last file name. Start as many runs as you like, then stop the server with **Ctrl+C**. If you started it without `-t`, stop it from another terminal:
+```powershell
+ssh pi "pkill -f '[p]ython3 collect_data'"
+```
+Web mode uses the camera, so it can't run at the same time as `live_detect.py`. Use `--port` to change the port.
+
+**Interactive mode** (`--label` only): press **Enter** to take a picture, and type **`q` + Enter** to quit. Move the object between shots. The `-t` flag is required over SSH so your keypresses reach the Pi:
 ```powershell
 ssh -t pi "cd ~/picamera_test && python3 collect_data.py --label cup"
 ```
@@ -131,14 +148,15 @@ Options:
 
 | Option | Default | Notes |
 |---|---|---|
-| `--label` | (required) | Letters, numbers, `-` and `_` only |
+| `--label` | – | Letters, numbers, `-` and `_` only. Leave out for web mode |
 | `--size` | `640x480` | `WIDTHxHEIGHT`. See the note on image size below |
 | `--count` | – | Turns on burst mode |
 | `--interval` | `1.0` | Seconds between burst shots |
 | `--quality` | `95` | JPEG quality |
 | `--dataset-dir` | `./dataset` | Root folder for the dataset |
+| `--host`, `--port` | `0.0.0.0`, `8000` | Web mode only |
 
-Autofocus runs continuously during collection.
+Autofocus runs continuously during collection. All three modes use the same camera setup as `live_detect.py` (a full-field-of-view sensor mode at the same output size), so training images are framed exactly like the frames the model sees.
 
 **Image size and framing:** the sensor is 16:9. A 4:3 size like `640x480` crops the sides, giving a narrower, more zoomed-in view. Use `--size 640x360` to keep the full width. Whatever size you choose, **use the same size and framing when you run the model later**.
 
@@ -346,7 +364,7 @@ Labels sit to the upper right of their point, and flip to the **left** (and belo
 | `ssh: connect to host ... timed out` | The Pi is off, or its IP address changed. Find it on the router (or check the ARP table with `arp -a`) and update `HostName` |
 | `Permission denied (publickey)` on `git pull` on the Pi | The Pi's `~/.ssh/id_ed25519.pub` must be added to GitHub. Test with `ssh -T git@github.com` on the Pi |
 | Camera errors such as `Device or resource busy` | Another program is using the camera, often a `live_detect.py` left running after Ctrl+C without `ssh -t`. Stop it with `ssh pi "pkill -f '[.]venv/bin/python live_detect'"` (or `pkill -f '[r]picam'` for camera apps), then try again |
-| `No interactive input (use 'ssh -t' or --count)` | Run interactive collection with `ssh -t`, or use burst mode |
+| `No interactive input (use 'ssh -t', --count, or web mode)` | Run interactive collection with `ssh -t`, or use burst or web mode |
 | `Set the EI_API_KEY environment variable...` | Set `$env:EI_API_KEY` in the same terminal before running `upload_dataset.py` |
 | Upload returns `HTTP 401/403` | The API key is wrong or belongs to a different project |
 | Scripts fail on the Pi with `\r` or `bad interpreter` | The file has Windows line endings. `.gitattributes` should prevent this. Re-checkout with `git rm --cached -r . && git reset --hard` (this discards uncommitted changes on the Pi) |
