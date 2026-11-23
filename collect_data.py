@@ -11,7 +11,7 @@ label folder already exists, new images are added to it (names never clash).
 Three modes:
   Web (default when no --label is given): live video in the browser, plus a
       form for the label, image count and interval, a Start/Stop button and
-      a live counter. Open http://<pi-address>:8000 after starting:
+      a live counter. The page address is printed at startup:
           ssh -t pi "cd ~/picamera_test && python3 collect_data.py"
   Interactive (--label only): press Enter to take a picture, q + Enter to quit.
           ssh -t pi "cd ~/picamera_test && python3 collect_data.py --label cup"
@@ -43,6 +43,8 @@ import argparse
 import logging
 import re
 import signal
+import socket
+import subprocess
 import sys
 import threading
 import time
@@ -562,7 +564,9 @@ def run_web(args: argparse.Namespace) -> int:
             return 1
         w, h = collector.frame_size
         logging.info("Collecting %dx%d images into %s", w, h, args.dataset_dir.expanduser().resolve())
-        logging.info("Open http://<pi-address>:%d in a browser  (Ctrl+C to stop)", args.port)
+        for address in page_addresses(args.host):
+            logging.info("Open http://%s:%d in a browser", address, args.port)
+        logging.info("Ctrl+C to stop")
         # Flask's built-in server; threaded=True gives each viewer its own thread.
         # Blocks until Ctrl+C / SIGTERM / a camera crash (KeyboardInterrupt).
         create_app(collector).run(host=args.host, port=args.port, threaded=True, use_reloader=False)
@@ -574,6 +578,19 @@ def run_web(args: argparse.Namespace) -> int:
             collector.join(timeout=5)
         logging.info("Stopped.")
     return 1 if collector.error else 0
+
+
+def page_addresses(host: str) -> list[str]:
+    """Addresses a browser can use to reach this Pi, for the startup message."""
+    if host not in ("0.0.0.0", ""):
+        return [host]  # listening on one specific address
+    # Listening on all interfaces: list this Pi's IPv4 addresses (Wi-Fi, Ethernet).
+    try:
+        out = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=2).stdout
+        addresses = [a for a in out.split() if "." in a]  # keep IPv4, skip IPv6
+    except (OSError, subprocess.SubprocessError):
+        addresses = []
+    return addresses or [f"{socket.gethostname()}.local"]  # fallback: mDNS name
 
 
 def require_flask() -> None:
