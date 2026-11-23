@@ -18,10 +18,12 @@ already has). Useful after deleting data in Studio or switching projects.
 For object detection projects, you then draw bounding boxes in Edge Impulse
 Studio (Data acquisition -> Labeling queue).
 
-The API key is read from the EI_API_KEY environment variable so it never
-ends up in the code, git, or your shell history. Get it from your project's
-Dashboard -> Keys page in Edge Impulse Studio, then in PowerShell:
-    $env:EI_API_KEY = "ei_..."        # current terminal only
+The API key never goes in the code or git. Get it from your project's
+Dashboard -> Keys page in Edge Impulse Studio, then either:
+  - save it once in .secrets/edge_impulse.env (git-ignored) as a line
+        EI_API_KEY=ei_...
+  - or set it for the current PowerShell terminal only (this wins over the file):
+        $env:EI_API_KEY = "ei_..."
 
 Usage:
     python upload_dataset.py --dry-run             # list what would be uploaded
@@ -48,6 +50,8 @@ BATCH_SIZE = 20  # files per HTTP request (keeps each request a reasonable size)
 UPLOADED_DIR = "_uploaded"
 # Words that identify a per-file "Edge Impulse already has this" rejection.
 DUPLICATE_HINTS = ("already exist", "duplicate", "same hash")
+# Git-ignored file holding KEY=VALUE lines, e.g. EI_API_KEY=ei_...
+SECRETS_FILE = PROJECT_DIR / ".secrets" / "edge_impulse.env"
 
 
 @dataclass
@@ -124,6 +128,30 @@ def count_uploaded(dataset_dir: Path, labels: list[str] | None) -> dict[str, int
         for label, d in label_dirs(dataset_dir / UPLOADED_DIR).items()
         if not labels or label in labels
     }
+
+
+def read_secrets(path: Path) -> dict[str, str]:
+    """Parse simple KEY=VALUE lines; blank lines and # comments are ignored."""
+    values = {}
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8-sig").splitlines():  # -sig: tolerate a Notepad BOM
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            values[key.strip()] = value.strip().strip("'\"")  # allow optional quotes
+    return values
+
+
+def load_api_key() -> str:
+    """API key from $env:EI_API_KEY, else from .secrets/edge_impulse.env. Never printed."""
+    key = os.environ.get("EI_API_KEY") or read_secrets(SECRETS_FILE).get("EI_API_KEY", "")
+    if not key or key == "ei_...":  # empty, or the placeholder left unchanged
+        raise SystemExit(
+            f"No Edge Impulse API key found. Put a line EI_API_KEY=ei_... in {SECRETS_FILE}\n"
+            "(Dashboard -> Keys in Edge Impulse Studio), or set $env:EI_API_KEY for this terminal."
+        )
+    return key
 
 
 def is_duplicate(message: str) -> bool:
@@ -218,9 +246,7 @@ def main() -> int:
         print("Dry run: nothing uploaded or moved.")
         return 0
 
-    api_key = os.environ.get("EI_API_KEY")
-    if not api_key:
-        raise SystemExit("Set the EI_API_KEY environment variable to your Edge Impulse project API key first.")
+    api_key = load_api_key()
 
     accepted = duplicates = moved = 0
     all_errors: list[str] = []

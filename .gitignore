@@ -26,8 +26,9 @@ output/
 logs/
 *.log
 
-# Secrets
+# Secrets (API keys, passwords). Never commit these; see README "Saving the API key".
 .env
+.secrets/
 
 # Trained models (copied to the Pi with scp, not stored in the public repo)
 models/

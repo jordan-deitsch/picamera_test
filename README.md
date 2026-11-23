@@ -185,10 +185,16 @@ After this, the PC holds the only copy until you upload to Edge Impulse, so back
 
 1. Create a project at <https://studio.edgeimpulse.com>. Choose **Images** and then **Object detection** (or **Classification** if you only need to know what's in the picture).
 2. Copy the project's **API key** from **Dashboard → Keys** in Edge Impulse Studio.
-3. Set it in your PowerShell session. It only lasts for that terminal, so it never goes into the code or git:
-   ```powershell
-   $env:EI_API_KEY = "ei_..."
+3. **Save the key once** in `.secrets/edge_impulse.env`. Open the file and replace `ei_...` with your key:
    ```
+   EI_API_KEY=ei_...
+   ```
+   ```powershell
+   notepad .secrets\edge_impulse.env
+   ```
+   The `.secrets/` folder is in `.gitignore`, so the key stays on this PC and never reaches GitHub (the repo is public). Check with `git check-ignore -v .secrets/edge_impulse.env`, which should print the matching `.gitignore` line. If the folder is missing (for example in a fresh clone), create it and the file with that one line.
+
+   To use a different key for one terminal only, set `$env:EI_API_KEY = "ei_..."`. It takes priority over the file.
 4. Check what will be uploaded, then upload:
    ```powershell
    python upload_dataset.py --dry-run
@@ -387,6 +393,6 @@ Labels sit to the upper right of their point, and flip to the **left** (and belo
 | `Permission denied (publickey)` on `git pull` on the Pi | The Pi's `~/.ssh/id_ed25519.pub` must be added to GitHub. Test with `ssh -T git@github.com` on the Pi |
 | Camera errors such as `Device or resource busy` | Another program is using the camera, often a `live_detect.py` left running after Ctrl+C without `ssh -t`. Stop it with `ssh pi "pkill -f '[.]venv/bin/python live_detect'"` (or `pkill -f '[r]picam'` for camera apps), then try again |
 | `No interactive input (use 'ssh -t', --count, or web mode)` | Run interactive collection with `ssh -t`, or use burst or web mode |
-| `Set the EI_API_KEY environment variable...` | Set `$env:EI_API_KEY` in the same terminal before running `upload_dataset.py` |
+| `No Edge Impulse API key found` | Put `EI_API_KEY=<your key>` in `.secrets/edge_impulse.env`, or set `$env:EI_API_KEY` in the same terminal |
 | Upload returns `HTTP 401/403` | The API key is wrong or belongs to a different project |
 | Scripts fail on the Pi with `\r` or `bad interpreter` | The file has Windows line endings. `.gitattributes` should prevent this. Re-checkout with `git rm --cached -r . && git reset --hard` (this discards uncommitted changes on the Pi) |
