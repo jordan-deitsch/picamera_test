@@ -60,8 +60,9 @@ except ImportError:
 
 DEFAULT_DATASET_DIR = Path(__file__).resolve().parent / "dataset"
 # Labels become folder and file names: only letters, digits, '-' and '_'
-# (this also blocks path tricks like "../").
-LABEL_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# and must start with a letter or digit (this blocks path tricks like "../",
+# and keeps names like "_uploaded" free for upload_dataset.py on the PC).
+LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 MAX_COUNT = 10000          # web mode: upper limit on images per run
 PREVIEW_JPEG_QUALITY = 70  # live stream only; saved images use --quality
 
@@ -101,7 +102,7 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
 
     if args.label is not None and not LABEL_RE.match(args.label):
-        parser.error("label may only contain letters, numbers, '-' and '_' (max 64 characters)")
+        parser.error("label must start with a letter or number and contain only letters, numbers, '-' and '_' (max 64)")
     if args.count is not None:
         if args.label is None:
             parser.error("--count needs --label (or omit both for web mode)")
@@ -394,7 +395,7 @@ PAGE = """<!doctype html>
   </div>
   <form class="card" id="form">
     <label>Label (folder and file prefix)
-      <input id="label" required maxlength="64" pattern="[A-Za-z0-9_\\-]+" list="labels"
+      <input id="label" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_\\-]*" list="labels"
              placeholder="e.g. pen" autocomplete="off">
       <datalist id="labels"></datalist>
     </label>
@@ -522,7 +523,7 @@ def create_app(collector: Collector):
         except (TypeError, ValueError):
             return jsonify(error="count and interval must be numbers"), 400
         if not LABEL_RE.match(label):
-            return jsonify(error="Label may only contain letters, numbers, - and _ (max 64)"), 400
+            return jsonify(error="Label must start with a letter or number and contain only letters, numbers, - and _ (max 64)"), 400
         if not 1 <= count <= MAX_COUNT:
             return jsonify(error=f"Images per run must be 1-{MAX_COUNT}"), 400
         if not 0 <= interval <= 3600:

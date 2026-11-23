@@ -51,10 +51,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def count_images(root: Path) -> dict[str, int]:
-    """Return {label: number of .jpg files} for each label folder under root."""
+    """Return {label: number of .jpg files} for each label folder under root.
+
+    Folders starting with "_" (like _uploaded/, used by upload_dataset.py) are not labels.
+    """
     if not root.is_dir():
         return {}
-    return {d.name: len(list(d.glob("*.jpg"))) for d in sorted(root.iterdir()) if d.is_dir()}
+    return {
+        d.name: len(list(d.glob("*.jpg")))
+        for d in sorted(root.iterdir())
+        if d.is_dir() and not d.name.startswith("_")
+    }
 
 
 def ssh(host: str, command: str, stdin: bytes | None = None) -> subprocess.CompletedProcess:
@@ -120,11 +127,14 @@ def main() -> int:
         # Never delete anything after a failed copy.
         raise SystemExit(f"scp failed (exit {result.returncode}). Has collect_data.py been run on the Pi yet?")
 
-    counts = count_images(local_dataset)
+    # Fetched images land in dataset/<label>/, i.e. "pending" for upload_dataset.py,
+    # even if an identical copy was uploaded before (Edge Impulse skips those).
+    pending = count_images(local_dataset)
+    uploaded = count_images(local_dataset / "_uploaded")
     print("Local dataset:")
-    for label, n in counts.items():
-        print(f"  {label}: {n} image(s)")
-    print(f"  total: {sum(counts.values())} image(s)")
+    for label in sorted(set(pending) | set(uploaded)):
+        print(f"  {label}: {pending.get(label, 0)} pending upload, {uploaded.get(label, 0)} already uploaded")
+    print(f"  total: {sum(pending.values())} pending, {sum(uploaded.values())} already uploaded")
 
     if args.delete_remote:
         delete_verified(args.host, args.remote_dataset, local_dataset)

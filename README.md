@@ -20,7 +20,7 @@ Development happens on a Windows PC. Code reaches the Pi through GitHub, and the
 | [`remote_capture.py`](remote_capture.py) | PC | Run `capture_still.py` on the Pi and copy the image into `captures/` on the PC |
 | [`collect_data.py`](collect_data.py) | Pi | Collect labeled training images into `dataset/<label>/`, from a web page with live video or from the terminal |
 | [`fetch_dataset.py`](fetch_dataset.py) | PC | Copy `dataset/` from the Pi to the PC |
-| [`upload_dataset.py`](upload_dataset.py) | PC | Upload `dataset/` to an Edge Impulse project |
+| [`upload_dataset.py`](upload_dataset.py) | PC | Upload new images in `dataset/` to an Edge Impulse project and move them to `dataset/_uploaded/` |
 | [`live_detect.py`](live_detect.py) | Pi | Run the FOMO model on the live camera feed and stream it with overlays to a web page |
 
 Each script starts with a docstring explaining what it does and how to run it. `live_detect.py`'s docstring also has an **architecture overview** (threads, data flow, processing steps), which is the best place to start reading the code.
@@ -148,7 +148,7 @@ Options:
 
 | Option | Default | Notes |
 |---|---|---|
-| `--label` | – | Letters, numbers, `-` and `_` only. Leave out for web mode |
+| `--label` | – | Letters, numbers, `-` and `_`, starting with a letter or number. Leave out for web mode |
 | `--size` | `640x480` | `WIDTHxHEIGHT`. See the note on image size below |
 | `--count` | – | Turns on burst mode |
 | `--interval` | `1.0` | Seconds between burst shots |
@@ -171,7 +171,7 @@ Autofocus runs continuously during collection. All three modes use the same came
 ```powershell
 python fetch_dataset.py
 ```
-This copies `~/picamera_test/dataset/` from the Pi into `./dataset/`, keeping the label folders, and prints how many images each label has. By default it never deletes anything on either machine.
+This copies `~/picamera_test/dataset/` from the Pi into `./dataset/`, keeping the label folders, and prints how many images per label are pending upload or already uploaded. Fetched images always count as not uploaded yet. By default it never deletes anything on either machine.
 
 To free space on the Pi after copying, add `--delete-remote`:
 ```powershell
@@ -204,9 +204,23 @@ Options:
 | `--category` | `split` | `split` lets Edge Impulse divide the images about 80/20 into training and testing; or use `training` / `testing` |
 | `--labels` | all | Only upload some labels, e.g. `--labels cup ball` |
 | `--dataset-dir` | `./dataset` | Root folder for the dataset |
-| `--dry-run` | – | List what would be uploaded without uploading |
+| `--all` | – | Also re-send images in `_uploaded/` (see below) |
+| `--dry-run` | – | List what would be uploaded without uploading or moving anything |
 
-The script uses Edge Impulse's **ingestion API**, so Node.js and the Edge Impulse CLI aren't needed. Each folder name becomes that image's label. The script tells Edge Impulse to **skip images it already has**, so re-running after collecting more is safe; skipped duplicates are reported but aren't errors.
+The script uses Edge Impulse's **ingestion API**, so Node.js and the Edge Impulse CLI aren't needed. Each folder name becomes that image's label.
+
+**Tracking what's been uploaded.** The local dataset has two kinds of folders:
+
+| Folder | Meaning |
+|---|---|
+| `dataset/<label>/` | **Pending**: not uploaded yet. `fetch_dataset.py` always puts images here |
+| `dataset/_uploaded/<label>/` | **Already in Edge Impulse** |
+
+By default only pending images are sent. After each batch, images that Edge Impulse accepted, or rejected because it already has them, are moved to `_uploaded/<label>/`. Images that failed for any other reason stay pending and are retried next time; the script lists them and exits with code 1. Running the script again therefore only sends new images.
+
+Use `--all` to re-send everything, including `_uploaded/`, for example after deleting data in Studio or switching to a new project. Edge Impulse still skips images it already has, because the script asks it to reject duplicates.
+
+If an image already in `_uploaded/` is fetched from the Pi again, it counts as pending. On the next upload Edge Impulse reports it as a duplicate and it moves back to `_uploaded/`. Fetching with `--delete-remote` avoids this.
 
 ### 4. Label, train, and deploy (in Edge Impulse Studio)
 
