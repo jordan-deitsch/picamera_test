@@ -370,10 +370,24 @@ Labels sit to the upper right of their point, and flip to the **left** (and belo
 
 | URL | Returns |
 |---|---|
-| `/` | Viewer page: live stream plus live coordinates, angle, and FPS |
+| `/` | Viewer page: live stream plus live coordinates, angle, FPS, CPU temperature and throttling |
 | `/stream` | MJPEG video with overlays |
 | `/snapshot.jpg` | One annotated frame |
-| `/api/detections` | Latest result as JSON. Intended for robot control later. `top`, `bottom`, and `pose` are the **smoothed** values to use for control. Each point has `x`, `y`, `confidence`, `size`, and `held`. `raw_top` / `raw_bottom` are this frame's unsmoothed measurements. Also includes `all_points` (raw FOMO cells), `smoothing`, `fps`, and `inference_ms` |
+| `/api/detections` | Latest result as JSON. Intended for robot control later. `top`, `bottom`, and `pose` are the **smoothed** values to use for control. Each point has `x`, `y`, `confidence`, `size`, and `held`. `raw_top` / `raw_bottom` are this frame's unsmoothed measurements. Also includes `all_points` (raw FOMO cells), `smoothing`, `fps`, `inference_ms`, and `system` (see below) |
+
+### Temperature and throttling
+
+The Pi 4 starts slowing its CPU (throttling) at **80 °C** and throttles hard at **85 °C**. A low supply voltage also causes throttling. `live_detect.py` checks both every 2 seconds:
+
+- **Viewer page:** the **CPU temp** row shows the temperature and current CPU clock. It turns orange at 75 °C and red at 80 °C. The **Throttling** row shows `none`, `earlier: ...` (happened since boot, orange), or `NOW: ...` (red).
+- **Terminal:** a `WARNING` line is logged when the temperature reaches 75 °C and when the Pi reports a new problem, so you see it even with no browser open. An `INFO` line follows when the temperature drops back.
+- **`/api/detections`:** the `system` object holds `temp_c`, `temp_warning`, `arm_mhz`, `throttled` (the raw flags, e.g. `0x0`), and the lists `now` and `since_boot`. Each list can contain `under-voltage`, `frequency capped`, `throttled`, and `soft temperature limit`.
+
+To check by hand on the Pi:
+```powershell
+ssh pi "vcgencmd measure_temp; vcgencmd get_throttled"
+```
+`throttled=0x0` means no problems since boot. With heatsinks and no fan, expect roughly 60–75 °C under continuous detection. If it approaches 80 °C, add a small 5 V fan. Power the motors from their own supply, not the Pi's 5 V, to avoid under-voltage.
 
 ### Performance and framing notes
 - On the Pi 4 the 96x96 FOMO model takes about **5 ms per frame**. The stream runs at the camera's **30 FPS**, leaving most of the processor free for robot control.

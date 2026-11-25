@@ -22,6 +22,10 @@ Two threads share one "latest result" (protected by a threading.Condition):
     -> draw overlay, encode JPEG
     -> publish JPEG + JSON  ------------------>  (read by the web handlers)
 
+  HealthMonitor thread: every 2 s reads the CPU temperature, clock and
+  throttle flags; added to /api/detections as "system" and logged to the
+  terminal when they need attention (see "system health" below).
+
 Processing steps per frame:
   1. Model input: the model's resize mode decides which part of the frame it
      sees. Ours is "fit-shortest": center square crop (480x480) -> 96x96.
@@ -668,6 +672,87 @@ class Detector(threading.Thread):
             return self.frame_id, self.jpeg
 
 
+# =========================================================================== system health
+
+# The Pi 4 starts throttling (lowering the CPU clock) at 80 °C and throttles
+# hard at 85 °C. Warn a little earlier so there's time to react.
+TEMP_WARN_C = 75.0
+TEMP_THROTTLE_C = 80.0
+# Bits of `vcgencmd get_throttled`. Bits 0-3 are "happening now"; the same
+# conditions shifted by 16 (bits 16-19) mean "has happened since boot".
+THROTTLE_BITS = {0: "under-voltage", 1: "frequency capped", 2: "throttled", 3: "soft temperature limit"}
+
+
+def read_int(path: str) -> int | None:
+    try:
+        return int(Path(path).read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def read_throttled() -> int | None:
+    """Raw throttle flags from the firmware (e.g. "throttled=0x50000" -> 0x50000)."""
+    try:
+        out = subprocess.run(["vcgencmd", "get_throttled"], capture_output=True, text=True, timeout=2).stdout
+        return int(out.strip().split("=")[1], 16)
+    except (OSError, subprocess.SubprocessError, IndexError, ValueError):
+        return None
+
+
+def read_health() -> dict:
+    """One reading of temperature, CPU clock and throttle state, as JSON-ready values."""
+    millideg = read_int("/sys/class/thermal/thermal_zone0/temp")         # 55017 -> 55.0 °C
+    khz = read_int("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")  # current CPU clock
+    flags = read_throttled()
+    temp_c = round(millideg / 1000, 1) if millideg is not None else None
+    return {
+        "temp_c": temp_c,
+        "temp_warning": temp_c is not None and temp_c >= TEMP_WARN_C,
+        "arm_mhz": round(khz / 1000) if khz is not None else None,
+        "throttled": f"0x{flags:x}" if flags is not None else None,
+        "now": [name for bit, name in THROTTLE_BITS.items() if flags and flags & (1 << bit)],
+        "since_boot": [name for bit, name in THROTTLE_BITS.items() if flags and flags & (1 << (bit + 16))],
+    }
+
+
+class HealthMonitor(threading.Thread):
+    """Background thread: refreshes read_health() every `interval` seconds.
+
+    Logs a warning in the terminal whenever the state gets worse (and a note
+    when the temperature recovers), so problems show up even with no browser open.
+    """
+
+    def __init__(self, interval: float = 2.0):
+        super().__init__(daemon=True)
+        self.interval = interval
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+        self.latest: dict = {}
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return dict(self.latest)
+
+    def run(self) -> None:
+        was_hot, seen_now, seen_boot = False, set(), set()
+        while not self.stop_event.is_set():
+            h = read_health()
+            with self.lock:
+                self.latest = h
+            if h["temp_warning"] and not was_hot:
+                logging.warning("CPU temperature %.1f °C (throttling starts at %.0f °C)", h["temp_c"], TEMP_THROTTLE_C)
+            elif was_hot and not h["temp_warning"]:
+                logging.info("CPU temperature back to %.1f °C", h["temp_c"])
+            was_hot = h["temp_warning"]
+            # Report each new condition once.
+            if new := set(h["now"]) - seen_now:
+                logging.warning("Pi reports now: %s (flags %s)", ", ".join(sorted(new)), h["throttled"])
+            if new := set(h["since_boot"]) - seen_boot:
+                logging.warning("Pi reports since boot: %s (flags %s)", ", ".join(sorted(new)), h["throttled"])
+            seen_now, seen_boot = set(h["now"]), seen_boot | set(h["since_boot"])
+            self.stop_event.wait(self.interval)
+
+
 # =========================================================================== web server
 
 # Viewer page: the <img> shows the MJPEG stream; the script polls
@@ -691,6 +776,7 @@ PAGE = """<!doctype html>
   dt { color: var(--muted); }
   dd { margin:0; }
   .top { color:#3cdc3c; } .bottom { color:#ff8c00; } .center { color:#ff00ff; }
+  .ok { color:#16a34a; } .warn { color:#d97706; font-weight:600; } .bad { color:#dc2626; font-weight:700; }
 </style>
 </head>
 <body>
@@ -708,6 +794,8 @@ PAGE = """<!doctype html>
       <dt class="center">Center</dt><dd id="center">–</dd>
       <dt>Angle</dt><dd id="angle">–</dd>
       <dt>Length</dt><dd id="length">–</dd>
+      <dt>CPU temp</dt><dd id="temp">–</dd>
+      <dt>Throttling</dt><dd id="throttle">–</dd>
     </dl>
   </div>
 </main>
@@ -724,6 +812,16 @@ PAGE = """<!doctype html>
       set("center", d.pose ? `(${d.pose.center_x.toFixed(0)}, ${d.pose.center_y.toFixed(0)})` : "–");
       set("angle", d.pose ? d.pose.angle_deg.toFixed(1) + "°" : "–");
       set("length", d.pose ? d.pose.length_px.toFixed(0) + " px" : "–");
+      // System health: color the temperature (ok < 75, warn < 80, hot >= 80 °C).
+      const s = d.system || {};
+      const temp = document.getElementById("temp");
+      temp.textContent = s.temp_c != null ? `${s.temp_c.toFixed(1)} °C  @ ${s.arm_mhz ?? "?"} MHz` : "–";
+      temp.className = s.temp_c == null ? "" : s.temp_c >= __THROTTLE_C__ ? "bad" : s.temp_c >= __WARN_C__ ? "warn" : "ok";
+      const thr = document.getElementById("throttle");
+      if (s.throttled == null) { thr.textContent = "–"; thr.className = ""; }
+      else if (s.now.length) { thr.textContent = "NOW: " + s.now.join(", "); thr.className = "bad"; }
+      else if (s.since_boot.length) { thr.textContent = "earlier: " + s.since_boot.join(", "); thr.className = "warn"; }
+      else { thr.textContent = "none"; thr.className = "ok"; }
     } catch (e) { /* server restarting; keep polling */ }
     setTimeout(poll, 200);
   }
@@ -731,11 +829,11 @@ PAGE = """<!doctype html>
 </script>
 </body>
 </html>
-"""
+""".replace("__WARN_C__", str(TEMP_WARN_C)).replace("__THROTTLE_C__", str(TEMP_THROTTLE_C))
 
 
-def create_app(detector: Detector) -> Flask:
-    """Build the Flask app. Handlers only read the detector's shared state."""
+def create_app(detector: Detector, health: HealthMonitor) -> Flask:
+    """Build the Flask app. Handlers only read the detector's and monitor's shared state."""
     app = Flask(__name__)
 
     @app.get("/")
@@ -765,7 +863,9 @@ def create_app(detector: Detector) -> Flask:
     @app.get("/api/detections")
     def detections():
         with detector.cond:
-            return jsonify(detector.latest)
+            latest = dict(detector.latest)
+        latest["system"] = health.snapshot()  # temperature / clock / throttle flags
+        return jsonify(latest)
 
     return app
 
@@ -801,6 +901,8 @@ def main() -> int:
     signal.signal(signal.SIGTERM, handle_sigterm)
 
     detector = Detector(args)
+    health = HealthMonitor()
+    health.start()  # temperature/throttle readings, logged even with no browser open
     try:
         # Start the camera/model thread and wait until it is streaming (or failed).
         detector.start()
@@ -814,11 +916,12 @@ def main() -> int:
         logging.info("Ctrl+C to stop")
         # Flask's built-in server; threaded=True gives each viewer its own thread.
         # Blocks until Ctrl+C / SIGTERM / a detector crash (KeyboardInterrupt).
-        create_app(detector).run(host=args.host, port=args.port, threaded=True, use_reloader=False)
+        create_app(detector, health).run(host=args.host, port=args.port, threaded=True, use_reloader=False)
     except KeyboardInterrupt:
         pass
     finally:
         # Ask the detector loop to exit; it releases the camera and model itself.
+        health.stop_event.set()
         detector.stop_event.set()
         if detector.is_alive():
             detector.join(timeout=5)
